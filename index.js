@@ -1,69 +1,74 @@
 require('dotenv').config();
 
-const express    = require('express');
-const http       = require('http');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const morgan     = require('morgan');
+const express = require('express');
+const http    = require('http');
+const cors    = require('cors');
+const helmet  = require('helmet');
+const morgan  = require('morgan');
 
-const { initSocket }       = require('./socket');
-const { generalLimiter }   = require('./middleware/rateLimiter');
+const { initSocket }     = require('./src/socket');
+const { generalLimiter, authLimiter } = require('./src/middleware/rateLimiter');
 
-// ── Routes ────────────────────────────────────────────────────────────────────
-const authRoutes          = require('./routes/auth');
-const matchRoutes         = require('./routes/matches');
-const marketRoutes        = require('./routes/markets');
-const ticketRoutes        = require('./routes/tickets');
-const drawRoutes          = require('./routes/draws');
-const transactionRoutes   = require('./routes/transactions');
-const userRoutes          = require('./routes/users');
-const notificationRoutes  = require('./routes/notifications');
-const liveRoutes          = require('./routes/live');
-const footballRoutes      = require('./routes/football');
+const authRoutes         = require('./src/routes/auth');
+const matchRoutes        = require('./src/routes/matches');
+const marketRoutes       = require('./src/routes/markets');
+const ticketRoutes       = require('./src/routes/tickets');
+const drawRoutes         = require('./src/routes/draws');
+const transactionRoutes  = require('./src/routes/transactions');
+const userRoutes         = require('./src/routes/users');
+const notificationRoutes = require('./src/routes/notifications');
+const liveRoutes         = require('./src/routes/live');
+const footballRoutes     = require('./src/routes/football');
 
-// ── App setup ─────────────────────────────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
 
-initSocket(server);
+// ── CORS ──────────────────────────────────────────────────────────────────────
+const isProd = process.env.NODE_ENV === 'production';
 
-// ── Security & parsing ────────────────────────────────────────────────────────
-app.use(helmet());
 const allowedOrigins = [
-  process.env.CLIENT_URL,
-  process.env.ADMIN_URL,
   'http://localhost:5173',
   'http://localhost:5174',
+  'https://win-a-lott.vercel.app',
+  process.env.CLIENT_URL,
+  process.env.ADMIN_URL,
+  ...(process.env.EXTRA_ORIGINS ? process.env.EXTRA_ORIGINS.split(',').map(o => o.trim()) : []),
 ].filter(Boolean);
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    if (!origin) return cb(null, true);
+    if (!isProd)  return cb(null, true);
+    if (allowedOrigins.some(o => origin.startsWith(o))) return cb(null, true);
     cb(new Error(`CORS: ${origin} not allowed`));
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// Raw body for Stripe webhook — must come BEFORE express.json()
-app.use('/api/transactions/webhook/stripe', express.raw({ type: 'application/json' }));
+// ── Security & parsing ────────────────────────────────────────────────────────
+app.use(helmet({ contentSecurityPolicy: false }));
+app.use(morgan(isProd ? 'combined' : 'dev'));
 
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: false }));
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+// Raw body for webhook — must come BEFORE express.json()
+app.use('/api/transactions/webhook', express.raw({ type: 'application/json' }));
+
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
-app.use('/api/', generalLimiter);
+app.use('/api', generalLimiter);
+app.use('/api/auth', authLimiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => {
-  res.json({
-    status:    'ok',
-    timestamp: new Date().toISOString(),
-    env:       process.env.NODE_ENV || 'development',
-  });
-});
+app.get('/health', (_req, res) => res.json({
+  status: 'ok',
+  ts:     new Date().toISOString(),
+  env:    process.env.NODE_ENV || 'development',
+}));
 
-// ── API Routes ────────────────────────────────────────────────────────────────
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api/auth',          authRoutes);
 app.use('/api/matches',       matchRoutes);
 app.use('/api/markets',       marketRoutes);
@@ -75,26 +80,25 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/live',          liveRoutes);
 app.use('/api/football',      footballRoutes);
 
-// ── 404 handler ───────────────────────────────────────────────────────────────
-app.use((req, res) => {
-  res.status(404).json({ success: false, error: `Route ${req.method} ${req.path} not found` });
-});
+// ── 404 ───────────────────────────────────────────────────────────────────────
+app.use((_req, res) => res.status(404).json({ success: false, error: 'Route not found' }));
 
-// ── Global error handler ──────────────────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error('[Error]', err.stack || err.message);
+// ── Error handler ─────────────────────────────────────────────────────────────
+app.use((err, _req, res, _next) => {
+  console.error('[error]', err.message);
   res.status(err.status || 500).json({
     success: false,
-    error:   process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    error: isProd ? 'Internal server error' : err.message,
   });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
+const PORT = parseInt(process.env.PORT || '3001', 10);
 server.listen(PORT, () => {
-  console.log(`\n🚀  WinALot API running on port ${PORT}`);
-  console.log(`    Health: http://localhost:${PORT}/health`);
-  console.log(`    Env:    ${process.env.NODE_ENV || 'development'}\n`);
+  console.log(`[server] bWinALOTT API running on port ${PORT} (${process.env.NODE_ENV || 'development'})`);
+  console.log(`[server] Health: http://localhost:${PORT}/health`);
 });
+
+initSocket(server);
 
 module.exports = { app, server };
