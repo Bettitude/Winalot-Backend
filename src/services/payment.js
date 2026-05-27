@@ -38,13 +38,25 @@ async function pp(method, path, data) {
     .then(r => r.data);
 }
 
+// ── Flutterwave ───────────────────────────────────────────────────────────
+const FW_BASE = 'https://api.flutterwave.com/v3';
+const fw = (method, path, data) => {
+  const key = process.env.FLUTTERWAVE_SECRET_KEY;
+  if (!key) throw new Error('FLUTTERWAVE_SECRET_KEY not configured');
+  return axios({ method, url: `${FW_BASE}${path}`, data,
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' } })
+    .then(r => r.data);
+};
+
 // ── Check if gateways are available ──────────────────────────────────────
-const paystackEnabled = () => !!process.env.PAYSTACK_SECRET_KEY;
-const paypalEnabled   = () => !!(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET);
+const paystackEnabled    = () => !!process.env.PAYSTACK_SECRET_KEY;
+const paypalEnabled      = () => !!(process.env.PAYPAL_CLIENT_ID && process.env.PAYPAL_CLIENT_SECRET);
+const flutterwaveEnabled = () => !!process.env.FLUTTERWAVE_SECRET_KEY;
 
 const paymentService = {
   paystackEnabled,
   paypalEnabled,
+  flutterwaveEnabled,
 
   // ── Deposits ─────────────────────────────────────────────────────────
   initPaystackDeposit: async ({ amountCents, email, userId, redirectUrl }) => {
@@ -69,6 +81,36 @@ const paymentService = {
       amountCents: res.data.amount,      // already in kobo/cents
       reference:   res.data.reference,
       email:       res.data.customer?.email,
+    };
+  },
+
+  initFlutterwaveDeposit: async ({ amountCents, email, userId, redirectUrl, bankTransferOnly = false }) => {
+    const reference = `WAL-FW-${userId.slice(0, 8)}-${Date.now()}`;
+    const amountUSD = amountCents / 100;
+    const body = {
+      tx_ref:       reference,
+      amount:       amountUSD,
+      currency:     process.env.FLUTTERWAVE_CURRENCY || 'USD',
+      redirect_url: redirectUrl || `${process.env.CLIENT_URL}/dashboard/wallet?verify=1&provider=flutterwave`,
+      customer:     { email },
+      customizations: { title: 'WinALot Wallet', description: 'WAP top-up', logo: `${process.env.CLIENT_URL}/logo.png` },
+      meta:         { userId },
+    };
+    if (bankTransferOnly) body.payment_options = 'banktransfer';
+    const res = await fw('POST', '/payments', body);
+    if (res.status !== 'success') throw new Error(res.message || 'Flutterwave init failed');
+    return { payment_url: res.data.link, reference };
+  },
+
+  verifyFlutterwaveDeposit: async (txRef) => {
+    const res = await fw('GET', `/transactions/verify_by_reference?tx_ref=${txRef}`);
+    if (res.status !== 'success') throw new Error(res.message || 'Flutterwave verification failed');
+    const d = res.data;
+    return {
+      status:      d.status === 'successful' ? 'success' : d.status,
+      amountCents: Math.round(d.charged_amount * 100),
+      reference:   d.tx_ref,
+      email:       d.customer?.email,
     };
   },
 

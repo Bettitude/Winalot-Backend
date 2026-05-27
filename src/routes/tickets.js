@@ -154,6 +154,20 @@ router.post('/', authMiddleware, async (req, res) => {
   }
 
   try {
+    // Staking window: reject if match is live, finished, or within 5 mins of kickoff
+    const matchRow = await queryOne('SELECT match_date, status FROM matches WHERE id = ?', [match_id]);
+    if (!matchRow) return res.status(404).json({ success: false, error: 'Match not found' });
+    if (matchRow.status === 'finished') {
+      return res.status(400).json({ success: false, error: 'Match has ended — staking is closed' });
+    }
+    if (matchRow.status === 'live') {
+      return res.status(400).json({ success: false, error: 'Match is live — staking is closed' });
+    }
+    const kickoff = new Date(matchRow.match_date).getTime();
+    if (Date.now() >= kickoff - 5 * 60 * 1000) {
+      return res.status(400).json({ success: false, error: 'Staking window has closed (5 minutes before kickoff)' });
+    }
+
     const market = await queryOne('SELECT * FROM markets WHERE id = ? AND status = "open"', [market_id]);
     if (!market) return res.status(404).json({ success: false, error: 'Market not found or closed' });
 

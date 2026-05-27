@@ -50,9 +50,24 @@ router.post('/deposit/init', authLimiter, authMiddleware, async (req, res) => {
 
   try {
     // ── Mock mode ─────────────────────────────────────────────────────
-    if (!IS_DB_CONFIGURED || (!paymentService.paystackEnabled() && !paymentService.paypalEnabled())) {
+    if (!IS_DB_CONFIGURED || (!paymentService.paystackEnabled() && !paymentService.paypalEnabled() && !paymentService.flutterwaveEnabled())) {
       const mock = paymentService.mockDeposit({ amountCents: amount, userId: req.user.id });
       return res.json({ success: true, data: { payment_url: null, reference: mock.reference, mock: true, amount }, message: 'Mock mode — no real payment' });
+    }
+
+    // ── Flutterwave ───────────────────────────────────────────────────
+    if (provider === 'flutterwave' || provider === 'flutterwave_bank') {
+      if (!paymentService.flutterwaveEnabled()) {
+        return res.status(400).json({ success: false, error: 'Flutterwave not configured' });
+      }
+      const result = await paymentService.initFlutterwaveDeposit({
+        amountCents: amount,
+        email:       req.user.email,
+        userId:      req.user.id,
+        redirectUrl: redirect_url,
+        bankTransferOnly: provider === 'flutterwave_bank',
+      });
+      return res.json({ success: true, data: { payment_url: result.payment_url, reference: result.reference } });
     }
 
     // ── PayPal ────────────────────────────────────────────────────────
@@ -117,6 +132,26 @@ router.post('/deposit/verify', authMiddleware, async (req, res) => {
       return res.json({ success: true, data: { amount_credited: amountCents }, message: 'PayPal deposit confirmed' });
     } catch (err) {
       return res.status(400).json({ success: false, error: err.message });
+    }
+  }
+
+  // ── Flutterwave verify ────────────────────────────────────────────
+  if (reference && reference.startsWith('WAL-FW-')) {
+    try {
+      const result = await paymentService.verifyFlutterwaveDeposit(reference);
+      if (result.status !== 'success') {
+        return res.status(400).json({ success: false, error: `Payment status: ${result.status}` });
+      }
+      if (IS_DB_CONFIGURED) {
+        const existing = await queryOne('SELECT id FROM transactions WHERE reference = ?', [reference]);
+        if (existing) return res.json({ success: true, data: { amount_credited: result.amountCents }, message: 'Already credited' });
+        await execute('UPDATE users SET wallet_balance = wallet_balance + ? WHERE id = ?', [result.amountCents, req.user.id]);
+        await execute('INSERT INTO transactions (id,user_id,type,amount,reference,status,metadata) VALUES (UUID(),?,"deposit",?,?,"completed",?)',
+          [req.user.id, result.amountCents, reference, JSON.stringify({ reference, amount: result.amountCents })]);
+      }
+      return res.json({ success: true, data: { amount_credited: result.amountCents }, message: 'Flutterwave deposit confirmed' });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
     }
   }
 
