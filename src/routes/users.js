@@ -72,6 +72,89 @@ router.post('/me/self-exclusion', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/users/me/payment-methods
+router.get('/me/payment-methods', authMiddleware, async (req, res) => {
+  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { methods: [] } });
+  try {
+    const methods = await query(
+      'SELECT id, type, label, details, is_default, created_at FROM payment_methods WHERE user_id = ? ORDER BY is_default DESC, created_at DESC',
+      [req.user.id]
+    );
+    return res.json({ success: true, data: { methods: methods.map(m => ({ ...m, details: JSON.parse(m.details || '{}') })) } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/users/me/payment-methods
+router.post('/me/payment-methods', authMiddleware, async (req, res) => {
+  const { type, label, details, is_default } = req.body;
+  if (!type || !details) return res.status(400).json({ success: false, error: 'type and details required' });
+  if (!['paypal', 'bank'].includes(type)) return res.status(400).json({ success: false, error: 'type must be paypal or bank' });
+
+  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { method: { id: `mock-${Date.now()}`, type, label, details, is_default: !!is_default } } });
+
+  try {
+    if (is_default) {
+      await execute('UPDATE payment_methods SET is_default = 0 WHERE user_id = ?', [req.user.id]);
+    }
+    await execute(
+      'INSERT INTO payment_methods (id, user_id, type, label, details, is_default) VALUES (UUID(), ?, ?, ?, ?, ?)',
+      [req.user.id, type, label || (type === 'paypal' ? 'PayPal' : 'Bank Account'), JSON.stringify(details), is_default ? 1 : 0]
+    );
+    const method = await queryOne('SELECT id, type, label, details, is_default FROM payment_methods WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [req.user.id]);
+    return res.json({ success: true, data: { method: { ...method, details: JSON.parse(method.details || '{}') } } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// DELETE /api/users/me/payment-methods/:id
+router.delete('/me/payment-methods/:id', authMiddleware, async (req, res) => {
+  if (!IS_DB_CONFIGURED) return res.json({ success: true, message: 'Deleted (mock)' });
+  try {
+    await execute('DELETE FROM payment_methods WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
+    return res.json({ success: true, message: 'Payment method removed' });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/users/leaderboard — public
+router.get('/leaderboard', async (req, res) => {
+  const period = req.query.period || 'weekly';
+  if (!IS_DB_CONFIGURED) {
+    const mock = Array.from({ length: 10 }, (_, i) => ({
+      rank: i + 1,
+      username: `player_${i + 1}`,
+      total_wins: 10 - i,
+      total_won:  (10 - i) * 250,
+    }));
+    return res.json({ success: true, data: { leaderboard: mock } });
+  }
+
+  try {
+    const dateFilter = period === 'monthly'
+      ? "AND t.updated_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
+      : "AND t.updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)";
+
+    const leaderboard = await query(
+      `SELECT u.username,
+              COUNT(t.id) AS total_wins,
+              COALESCE(SUM(t.prize_amount), 0) AS total_won
+       FROM tickets t
+       JOIN users u ON u.id = t.user_id
+       WHERE t.status = 'won' ${dateFilter}
+       GROUP BY u.id, u.username
+       ORDER BY total_won DESC
+       LIMIT 50`
+    );
+    return res.json({ success: true, data: { leaderboard: leaderboard.map((r, i) => ({ ...r, rank: i + 1 })) } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // GET /api/users  (admin)
 router.get('/', adminMiddleware, async (req, res) => {
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { users: [], total: 0 } });
@@ -180,89 +263,6 @@ router.get('/:id/stats', authMiddleware, async (req, res) => {
     );
     const won = await queryOne('SELECT COALESCE(SUM(prize_amount), 0) AS total_won FROM winners WHERE user_id = ?', [req.params.id]);
     return res.json({ success: true, data: { ...stats, total_won: won?.total_won || 0 } });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// GET /api/users/me/payment-methods
-router.get('/me/payment-methods', authMiddleware, async (req, res) => {
-  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { methods: [] } });
-  try {
-    const methods = await query(
-      'SELECT id, type, label, details, is_default, created_at FROM payment_methods WHERE user_id = ? ORDER BY is_default DESC, created_at DESC',
-      [req.user.id]
-    );
-    return res.json({ success: true, data: { methods: methods.map(m => ({ ...m, details: JSON.parse(m.details || '{}') })) } });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// POST /api/users/me/payment-methods
-router.post('/me/payment-methods', authMiddleware, async (req, res) => {
-  const { type, label, details, is_default } = req.body;
-  if (!type || !details) return res.status(400).json({ success: false, error: 'type and details required' });
-  if (!['paypal', 'bank'].includes(type)) return res.status(400).json({ success: false, error: 'type must be paypal or bank' });
-
-  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { method: { id: `mock-${Date.now()}`, type, label, details, is_default: !!is_default } } });
-
-  try {
-    if (is_default) {
-      await execute('UPDATE payment_methods SET is_default = 0 WHERE user_id = ?', [req.user.id]);
-    }
-    await execute(
-      'INSERT INTO payment_methods (id, user_id, type, label, details, is_default) VALUES (UUID(), ?, ?, ?, ?, ?)',
-      [req.user.id, type, label || (type === 'paypal' ? 'PayPal' : 'Bank Account'), JSON.stringify(details), is_default ? 1 : 0]
-    );
-    const method = await queryOne('SELECT id, type, label, details, is_default FROM payment_methods WHERE user_id = ? ORDER BY created_at DESC LIMIT 1', [req.user.id]);
-    return res.json({ success: true, data: { method: { ...method, details: JSON.parse(method.details || '{}') } } });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// DELETE /api/users/me/payment-methods/:id
-router.delete('/me/payment-methods/:id', authMiddleware, async (req, res) => {
-  if (!IS_DB_CONFIGURED) return res.json({ success: true, message: 'Deleted (mock)' });
-  try {
-    await execute('DELETE FROM payment_methods WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
-    return res.json({ success: true, message: 'Payment method removed' });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// GET /api/users/leaderboard — public
-router.get('/leaderboard', async (req, res) => {
-  const period = req.query.period || 'weekly';
-  if (!IS_DB_CONFIGURED) {
-    const mock = Array.from({ length: 10 }, (_, i) => ({
-      rank: i + 1,
-      username: `player_${i + 1}`,
-      total_wins: 10 - i,
-      total_won:  (10 - i) * 250,
-    }));
-    return res.json({ success: true, data: { leaderboard: mock } });
-  }
-
-  try {
-    const dateFilter = period === 'monthly'
-      ? "AND t.updated_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
-      : "AND t.updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)";
-
-    const leaderboard = await query(
-      `SELECT u.username,
-              COUNT(t.id) AS total_wins,
-              COALESCE(SUM(t.prize_amount), 0) AS total_won
-       FROM tickets t
-       JOIN users u ON u.id = t.user_id
-       WHERE t.status = 'won' ${dateFilter}
-       GROUP BY u.id, u.username
-       ORDER BY total_won DESC
-       LIMIT 50`
-    );
-    return res.json({ success: true, data: { leaderboard: leaderboard.map((r, i) => ({ ...r, rank: i + 1 })) } });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
