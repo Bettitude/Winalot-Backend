@@ -19,6 +19,8 @@ const userRoutes         = require('./src/routes/users');
 const notificationRoutes = require('./src/routes/notifications');
 const liveRoutes         = require('./src/routes/live');
 const footballRoutes     = require('./src/routes/football');
+const adminStatsRoutes   = require('./src/routes/adminStats');
+const analyticsRoutes    = require('./src/routes/analytics');
 
 const app    = express();
 const server = http.createServer(app);
@@ -79,6 +81,8 @@ app.use('/api/users',         userRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/live',          liveRoutes);
 app.use('/api/football',      footballRoutes);
+app.use('/api/admin/stats',   adminStatsRoutes);
+app.use('/api/analytics',    analyticsRoutes);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ success: false, error: 'Route not found' }));

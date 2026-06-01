@@ -51,10 +51,15 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
     const matches = await query(
       `SELECT m.*,
         JSON_ARRAYAGG(
-          JSON_OBJECT('id', mk.id, 'tier', mk.tier, 'ticket_price', mk.entry_fee,
-            'max_tickets', 200, 'fill_percent', 0, 'correct_prediction', mk.correct_outcome,
+          JSON_OBJECT(
+            'id', mk.id, 'tier', mk.tier, 'ticket_price', mk.entry_fee,
+            'max_tickets', 200, 'fill_percent', 0,
+            'correct_prediction', mk.correct_outcome,
             'status', mk.status, 'name', mk.market_type, 'type', mk.market_type,
             'max_winners', mk.winner_count, 'prize_pool', mk.prize_pool,
+            'prediction_type', mk.prediction_type,
+            'admin_pick', mk.admin_pick,
+            'auto_options', mk.auto_options,
             'options', JSON_ARRAY(
               JSON_OBJECT('label', m.team_home, 'value', 'home'),
               JSON_OBJECT('label', 'Draw', 'value', 'draw'),

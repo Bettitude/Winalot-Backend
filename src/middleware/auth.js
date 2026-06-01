@@ -6,8 +6,10 @@ const JWT_SECRET = process.env.JWT_SECRET || 'winalott_dev_secret_change_in_prod
 // Demo accounts: client-side sessions that bypass JWT verification.
 // Only these specific tokens are accepted (not any arbitrary demo_token_ prefix).
 const DEMO_USERS = {
-  'demo_token_demo-user-001': { id: 'demo-user-001', email: 'demo@winalott.com',  role: 'user', username: 'demo_user',    wallet_balance: 50000 },
-  'demo_token_demo-user-002': { id: 'demo-user-002', email: 'test@example.com',   role: 'user', username: 'test_player',  wallet_balance: 12500 },
+  'demo_token_demo-user-001':          { id: 'demo-user-001',   email: 'demo@winalott.com',       role: 'user',  username: 'demo_user',    wallet_balance: 50000 },
+  'demo_token_demo-user-002':          { id: 'demo-user-002',   email: 'test@example.com',        role: 'user',  username: 'test_player',  wallet_balance: 12500 },
+  'dummy_admin_token_dummy-admin-001': { id: 'dummy-admin-001', email: 'admin@winalott.com',      role: 'admin', username: 'admin',         wallet_balance: 0 },
+  'dummy_admin_token_dummy-admin-002': { id: 'dummy-admin-002', email: 'superadmin@winalott.com', role: 'admin', username: 'superadmin',    wallet_balance: 0 },
 };
 
 /**

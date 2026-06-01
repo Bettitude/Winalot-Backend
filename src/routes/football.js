@@ -18,6 +18,20 @@ const h = fn => (req, res) =>
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
+router.get('/fixtures/search', h(async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.json({ success: true, data: [] });
+  // Search upcoming fixtures by team name
+  const upcoming = await getUpcomingFixtures(50);
+  const term = q.toLowerCase();
+  const matches = (upcoming || []).filter(f => {
+    const home = (f.teams?.home?.name || '').toLowerCase();
+    const away = (f.teams?.away?.name || '').toLowerCase();
+    return home.includes(term) || away.includes(term);
+  }).slice(0, 10);
+  res.json({ success: true, data: matches });
+}));
+
 router.get('/fixtures/live', h(async (_, res) => {
   res.json({ success: true, data: await getLiveFixtures() });
 }));
