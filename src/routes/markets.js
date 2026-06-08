@@ -4,7 +4,7 @@ const { query, queryOne, execute, transaction, IS_DB_CONFIGURED } = require('../
 const { adminMiddleware, auditLog } = require('../middleware/admin');
 const { cacheMiddleware }           = require('../middleware/cache');
 const { IS_MOCK, fixtureToMatch }   = require('../lib/mockMode');
-const { getFixtureById }            = require('../services/footballService');
+const { getFixtureById, getFixturePredictions } = require('../services/footballService');
 const { generateOptions, identifyCorrectOption } = require('../services/marketOptions');
 
 // ── GET /api/markets ───────────────────────────────────────────────────────────
@@ -63,6 +63,27 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
     }));
 
     return res.json({ success: true, data: { markets: marketsWithPools, total: totals[0]?.total || 0 } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/markets/predictions?fixture_id=:id ───────────────────────────────
+// Must be before /:id to avoid Express matching "predictions" as an ID
+router.get('/predictions', async (req, res) => {
+  const { fixture_id } = req.query;
+  if (!fixture_id) return res.status(400).json({ success: false, error: 'fixture_id is required' });
+
+  try {
+    const pred = await getFixturePredictions(fixture_id);
+    if (!pred) return res.json({ success: true, data: { pick: null } });
+
+    const advice  = pred.predictions?.advice || null;
+    const winner  = pred.predictions?.winner?.name || null;
+    const percent = pred.predictions?.percent || null;
+    const pick    = advice || (winner ? `${winner} to win` : null);
+
+    return res.json({ success: true, data: { pick, advice, winner, percent } });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
@@ -154,6 +175,19 @@ router.post('/', adminMiddleware, async (req, res) => {
       autoOptions = generateOptions(market_type, match.team_home, match.team_away);
     }
 
+    // For api_pick: auto-fetch API-Football's suggested prediction
+    let resolvedAdminPick = admin_pick || null;
+    if (prediction_type === 'api_pick' && match.api_fixture_id) {
+      try {
+        const pred = await getFixturePredictions(match.api_fixture_id);
+        if (pred?.predictions?.advice) {
+          resolvedAdminPick = pred.predictions.advice;
+        } else if (pred?.predictions?.winner?.name) {
+          resolvedAdminPick = `${pred.predictions.winner.name} to win`;
+        }
+      } catch { /* use manual admin_pick if provided */ }
+    }
+
     // Determine base tier/entry_fee for backward compatibility
     const baseTier    = tier || (tiers && tiers[0]?.tier) || 'silver';
     const baseEntryFee = entry_fee || (tiers && tiers[0]?.entry_fee_points) || 100;
@@ -166,7 +200,7 @@ router.post('/', adminMiddleware, async (req, res) => {
        VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NOW())`,
       [
         match_id, market_type, prediction_type,
-        prediction_type === 'market_pick' ? (admin_pick || null) : null,
+        (prediction_type === 'market_pick' || prediction_type === 'api_pick') ? resolvedAdminPick : null,
         autoOptions ? JSON.stringify(autoOptions) : null,
         baseTier, parseInt(baseEntryFee), parseInt(baseWinnerCount),
         staking_opens_at || null, staking_closes_at || null,

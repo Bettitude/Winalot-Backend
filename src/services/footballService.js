@@ -172,6 +172,14 @@ const getFixtureOdds = (fixtureId) =>
     return res.data.response;
   });
 
+// ── Predictions (API-Football suggested picks) ────────────────────────────────
+
+const getFixturePredictions = (fixtureId) =>
+  cached(`fs:predictions:${fixtureId}`, TTL.FIXTURES, async () => {
+    const res = await apiSports.get('/predictions', { params: { fixture: fixtureId } });
+    return res.data.response?.[0] || null;
+  }, null);
+
 // ── Players ───────────────────────────────────────────────────────────────────
 
 const getPlayer = (playerId, season = new Date().getFullYear()) =>
@@ -199,5 +207,6 @@ module.exports = {
   getTeamSquad,
   searchTeam,
   getFixtureOdds,
+  getFixturePredictions,
   getPlayer,
 };

@@ -7,7 +7,7 @@ const {
   getMatchStats, getMatchLineups, getMatchEvents, getH2H, getPlayerRatings,
   getStandings, getAllLeagues, getTopLeagues,
   getTeamInfo, getTeamStats, getTeamSquad, searchTeam,
-  getFixtureOdds, getPlayer,
+  getFixtureOdds, getFixturePredictions, getPlayer,
 } = require('../services/footballService');
 
 const h = fn => (req, res) =>
@@ -49,6 +49,11 @@ router.get('/fixtures/league/:leagueId', h(async (req, res) => {
     success: true,
     data: await getFixturesByLeague(req.params.leagueId, req.query.season),
   });
+}));
+
+router.get('/fixtures/:id/predictions', h(async (req, res) => {
+  const data = await getFixturePredictions(req.params.id);
+  res.json({ success: true, data });
 }));
 
 router.get('/fixtures/:id', h(async (req, res) => {
