@@ -119,28 +119,44 @@ router.get('/:id', async (req, res) => {
 
 // POST /api/matches  (admin)
 router.post('/', adminMiddleware, async (req, res) => {
-  const { title, team_home, team_away, team_home_id, team_away_id, league, league_id,
-          stadium, match_date, ticket_sales_close, api_fixture_id } = req.body;
+  const {
+    title, team_home, team_away, team_home_id, team_away_id,
+    league, league_id, stadium, match_date, ticket_sales_close,
+    api_fixture_id, home_logo, away_logo,
+    status: reqStatus,   // admin may pass 'draft' or 'active'
+  } = req.body;
 
-  if (!title || !team_home || !team_away) {
-    return res.status(400).json({ success: false, error: 'title, team_home, team_away required' });
+  if (!team_home || !team_away) {
+    return res.status(400).json({ success: false, error: 'team_home and team_away are required' });
   }
 
+  const resolvedTitle  = title || `${team_home} vs ${team_away}`;
+  const resolvedStatus = ['draft', 'active'].includes(reqStatus) ? reqStatus : 'draft';
+
   if (!IS_DB_CONFIGURED) {
-    return res.status(201).json({ success: true, data: { match: { id: `mock-${Date.now()}`, ...req.body } } });
+    return res.status(201).json({
+      success: true,
+      data: { match: { id: `mock-${Date.now()}`, ...req.body, title: resolvedTitle } },
+    });
   }
 
   try {
     await execute(
-      `INSERT INTO matches (id, title, team_home, team_away, team_home_id, team_away_id, league, league_id,
-        stadium, match_date, ticket_sales_close, status, api_fixture_id, author_id)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?)`,
-      [title, team_home, team_away, team_home_id || null, team_away_id || null,
-       league || null, league_id || null, stadium || null,
-       match_date, ticket_sales_close || match_date, api_fixture_id || null, req.user.id]
+      `INSERT INTO matches
+        (id, title, team_home, team_away, team_home_id, team_away_id, league, league_id,
+         stadium, match_date, ticket_sales_close, status, api_fixture_id, home_logo, away_logo, author_id)
+       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        resolvedTitle, team_home, team_away,
+        team_home_id || null, team_away_id || null,
+        league || null, league_id || null, stadium || null,
+        match_date, ticket_sales_close || match_date,
+        resolvedStatus, api_fixture_id || null,
+        home_logo || null, away_logo || null,
+        req.user.id,
+      ]
     );
 
-    // Fetch the inserted match
     const match = await queryOne('SELECT * FROM matches ORDER BY created_at DESC LIMIT 1');
     auditLog(req.user.id, 'CREATE_MATCH', match.id);
     return res.status(201).json({ success: true, data: { match }, message: 'Match created' });
@@ -152,7 +168,7 @@ router.post('/', adminMiddleware, async (req, res) => {
 // PUT /api/matches/:id  (admin)
 router.put('/:id', adminMiddleware, async (req, res) => {
   const allowed = ['title', 'team_home', 'team_away', 'league', 'stadium', 'match_date',
-                   'ticket_sales_close', 'status', 'api_fixture_id'];
+                   'ticket_sales_close', 'status', 'api_fixture_id', 'home_logo', 'away_logo'];
   const updates = {};
   allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
 

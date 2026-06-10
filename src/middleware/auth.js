@@ -1,58 +1,88 @@
-const jwt  = require('jsonwebtoken');
-const { queryOne, IS_DB_CONFIGURED } = require('../lib/db');
+const jwt            = require('jsonwebtoken');
+const { supabaseAdmin } = require('../lib/supabase');
+const { getCached, setCache } = require('../lib/redis');
+const { execute }    = require('../lib/db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'winalott_dev_secret_change_in_prod';
 
-// Demo accounts: client-side sessions that bypass JWT verification.
-// Only these specific tokens are accepted (not any arbitrary demo_token_ prefix).
-const DEMO_USERS = {
-  'demo_token_demo-user-001':          { id: 'demo-user-001',   email: 'demo@winalott.com',       role: 'user',  username: 'demo_user',    wallet_balance: 50000 },
-  'demo_token_demo-user-002':          { id: 'demo-user-002',   email: 'test@example.com',        role: 'user',  username: 'test_player',  wallet_balance: 12500 },
-  'dummy_admin_token_dummy-admin-001': { id: 'dummy-admin-001', email: 'admin@winalott.com',      role: 'admin', username: 'admin',         wallet_balance: 0 },
-  'dummy_admin_token_dummy-admin-002': { id: 'dummy-admin-002', email: 'superadmin@winalott.com', role: 'admin', username: 'superadmin',    wallet_balance: 0 },
-};
+// Cache user status for 2 minutes — prevents a DB hit on every request.
+// This means a suspended user gets at most 2 more minutes of access.
+const USER_CACHE_TTL = 120;
+
+async function getUser(userId) {
+  const cacheKey = `user:status:${userId}`;
+
+  // Fast path — Redis hit (~1ms)
+  const cached = await getCached(cacheKey);
+  if (cached) return cached;
+
+  // Slow path — Supabase query (~50ms), cache for next 2 min
+  const IS_SUPABASE = !!(
+    process.env.SUPABASE_URL &&
+    process.env.SUPABASE_SERVICE_ROLE_KEY &&
+    !process.env.SUPABASE_URL.includes('your-')
+  );
+
+  if (!IS_SUPABASE) return null;
+
+  const { data } = await supabaseAdmin
+    .from('btwin_users')
+    .select('id, email, username, role, status, wallet_balance')
+    .eq('id', userId)
+    .single();
+
+  if (data) await setCache(cacheKey, data, USER_CACHE_TTL);
+  return data || null;
+}
 
 /**
- * Verify our own JWT and attach user row to req.user
+ * Verify our JWT and attach user to req.user.
+ * JWT verification is in-memory (O(1)) — no DB hit per request.
+ * Only the status check hits Redis/Supabase (cached 2 min).
  */
 async function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
-  if (!header || !header.startsWith('Bearer ')) {
+  if (!header?.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, error: 'Missing authorization header', code: 401 });
   }
 
   const token = header.split(' ')[1];
 
-  // Accept known demo tokens without JWT verification
-  if (DEMO_USERS[token]) {
-    req.user  = DEMO_USERS[token];
-    req.token = token;
-    return next();
+  let payload;
+  try {
+    payload = jwt.verify(token, JWT_SECRET);
+  } catch {
+    return res.status(401).json({ success: false, error: 'Invalid or expired token', code: 401 });
   }
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
+    const user = await getUser(payload.sub);
 
-    if (!IS_DB_CONFIGURED) {
-      // Dev/mock mode — accept any valid JWT and fake a user
-      req.user  = { id: payload.sub, email: payload.email, role: payload.role || 'user', username: payload.username };
+    if (!user) {
+      // Dev mode — no Supabase configured. Accept any valid JWT.
+      req.user  = { id: payload.sub, email: payload.email, role: payload.role || 'user', username: payload.username, wallet_balance: 0 };
       req.token = token;
       return next();
     }
 
-    const user = await queryOne('SELECT * FROM users WHERE id = ? AND status = "enabled"', [payload.sub]);
-    if (!user) return res.status(401).json({ success: false, error: 'User not found or suspended', code: 401 });
+    if (user.status === 'suspended') {
+      return res.status(403).json({ success: false, error: 'Account suspended', code: 403 });
+    }
+    if (user.status === 'disabled') {
+      return res.status(403).json({ success: false, error: 'Account disabled', code: 403 });
+    }
 
     req.user  = user;
     req.token = token;
     next();
   } catch (err) {
-    return res.status(401).json({ success: false, error: 'Invalid or expired token', code: 401 });
+    console.error('[authMiddleware]', err.message);
+    return res.status(500).json({ success: false, error: 'Auth check failed', code: 500 });
   }
 }
 
 /**
- * Middleware that only allows admin users through
+ * Admin-only middleware. Runs authMiddleware first.
  */
 async function adminMiddleware(req, res, next) {
   await authMiddleware(req, res, () => {
@@ -64,17 +94,37 @@ async function adminMiddleware(req, res, next) {
 }
 
 /**
- * Log an admin action to the audit_log table
+ * Write an admin action to btwin_audit_log.
+ * Non-blocking — never throws.
  */
-async function auditLog(adminId, action, targetTable, targetId, meta = {}) {
-  if (!IS_DB_CONFIGURED) return;
+async function auditLog(adminId, action, targetType, targetId, meta = {}) {
+  const IS_DB = !!(process.env.DB_HOST && !process.env.DB_HOST.includes('your-'));
+  const IS_SUPABASE = !!(process.env.SUPABASE_URL && !process.env.SUPABASE_URL.includes('your-'));
+
   try {
-    const { execute } = require('../lib/db');
-    await execute(
-      'INSERT INTO audit_log (id, admin_id, action, target_table, target_id, metadata) VALUES (UUID(), ?, ?, ?, ?, ?)',
-      [adminId, action, targetTable || null, targetId || null, JSON.stringify(meta)]
-    );
-  } catch { /* non-blocking */ }
+    if (IS_SUPABASE) {
+      await supabaseAdmin
+        .from('btwin_audit_log')
+        .insert({ admin_id: adminId, action, target_type: targetType || null, target_id: targetId || null, metadata: meta });
+    } else if (IS_DB) {
+      await execute(
+        'INSERT INTO btwin_audit_log (id, admin_id, action, target_type, target_id, metadata) VALUES (UUID(), ?, ?, ?, ?, ?)',
+        [adminId, action, targetType || null, targetId || null, JSON.stringify(meta)]
+      );
+    }
+  } catch { /* audit log is non-blocking */ }
 }
 
-module.exports = { authMiddleware, adminMiddleware, auditLog, JWT_SECRET };
+/**
+ * Invalidate the Redis user-status cache for a given user.
+ * Call this when a user is suspended, enabled, or their role changes.
+ */
+async function invalidateUserCache(userId) {
+  const { getRedis } = require('../lib/redis');
+  const r = getRedis();
+  if (r) {
+    try { await r.del(`user:status:${userId}`); } catch { /* non-blocking */ }
+  }
+}
+
+module.exports = { authMiddleware, adminMiddleware, auditLog, invalidateUserCache, JWT_SECRET };

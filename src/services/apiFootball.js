@@ -45,10 +45,15 @@ async function apiFetch(endpoint, ttl = 60) {
     });
 
     req.on('error', (err) => {
-      // Attempt to serve stale cache on error
-      getRedis().get(cacheKey)
-        .then(stale => stale ? resolve(JSON.parse(stale)) : reject(err))
-        .catch(() => reject(err));
+      // Attempt to serve stale cache on network error
+      const redis = getRedis();
+      if (redis) {
+        redis.get(cacheKey)
+          .then(stale => stale ? resolve(JSON.parse(stale)) : reject(err))
+          .catch(() => reject(err));
+      } else {
+        reject(err);
+      }
     });
 
     req.end();
@@ -56,14 +61,19 @@ async function apiFetch(endpoint, ttl = 60) {
 }
 
 const apiFootball = {
-  getLiveMatches:    ()          => apiFetch('/fixtures?live=all',                30),
-  getTodayFixtures:  ()          => apiFetch(`/fixtures?date=${today()}`,         60),
-  getFixture:        (id)        => apiFetch(`/fixtures?id=${id}`,                30),
-  getStats:          (fixtureId) => apiFetch(`/fixtures/statistics?fixture=${fixtureId}`, 60),
-  getLineups:        (fixtureId) => apiFetch(`/fixtures/lineups?fixture=${fixtureId}`,    300),
-  getOdds:           (fixtureId) => apiFetch(`/odds?fixture=${fixtureId}`,               300),
-  getStandings:      (leagueId)  => apiFetch(`/standings?league=${leagueId}&season=2024`, 300),
-  getLeagues:        ()          => apiFetch('/leagues',                          600),
+  getLiveMatches:        ()          => apiFetch('/fixtures?live=all',                30),
+  getTodayFixtures:      ()          => apiFetch(`/fixtures?date=${today()}`,         60),
+  getFixture:            (id)        => apiFetch(`/fixtures?id=${id}`,                30),
+  getStats:              (fixtureId) => apiFetch(`/fixtures/statistics?fixture=${fixtureId}`, 60),
+  getLineups:            (fixtureId) => apiFetch(`/fixtures/lineups?fixture=${fixtureId}`,    300),
+  getOdds:               (fixtureId) => apiFetch(`/odds?fixture=${fixtureId}`,               300),
+  getStandings:          (leagueId)  => apiFetch(`/standings?league=${leagueId}&season=2024`, 300),
+  getLeagues:            ()          => apiFetch('/leagues',                          600),
+  // World Cup 2026 — league 1, season 2026
+  getWorldCupFixtures:   (date)      => apiFetch(`/fixtures?league=1&season=2026${date ? `&date=${date}` : ''}`, 60),
+  getWorldCupLive:       ()          => apiFetch('/fixtures?league=1&season=2026&live=all', 30),
+  getWorldCupStandings:  ()          => apiFetch('/standings?league=1&season=2026',        300),
+  getWorldCupByDate:     (date)      => apiFetch(`/fixtures?league=1&season=2026&date=${date}`, 60),
 };
 
 function today() {

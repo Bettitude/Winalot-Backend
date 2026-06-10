@@ -68,6 +68,133 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
   }
 });
 
+// ── POST /api/markets/bulk ────────────────────────────────────────────────────
+// Bulk-create markets for multiple fixtures at once (Mode 2 or Mode 3).
+// Body: { fixtures: [{fixture_id, team_home, team_away, match_date, league, home_logo, away_logo}],
+//         market_type, prediction_type, tiers }
+//
+// For each fixture:
+//   - Creates (or reuses) a match row
+//   - Creates one market row per tier
+//   - Mode 3: auto-fetches API-Football prediction per fixture (best-effort)
+//
+router.post('/bulk', adminMiddleware, async (req, res) => {
+  const {
+    fixtures = [],
+    market_type,
+    prediction_type = 'market_type',
+    tiers = [{ tier: 'silver', entry_fee_points: 100, winner_count: 5 }],
+    staking_opens_at, staking_closes_at,
+  } = req.body;
+
+  if (!market_type || !fixtures.length) {
+    return res.status(400).json({ success: false, error: 'market_type and fixtures[] are required' });
+  }
+
+  if (!IS_DB_CONFIGURED) {
+    return res.status(201).json({
+      success: true,
+      data: { created: fixtures.length, skipped: 0, errors: [] },
+      message: `Bulk create skipped (mock mode)`,
+    });
+  }
+
+  const results = { created: 0, skipped: 0, errors: [] };
+
+  for (const fx of fixtures) {
+    try {
+      const fixtureId  = fx.fixture_id || null;
+      const teamHome   = fx.team_home || 'Home';
+      const teamAway   = fx.team_away || 'Away';
+      const matchDate  = fx.match_date || new Date().toISOString();
+
+      // Reuse existing match if already imported, otherwise create it
+      let match = fixtureId
+        ? await queryOne('SELECT * FROM matches WHERE api_fixture_id = ?', [fixtureId])
+        : null;
+
+      if (!match) {
+        await execute(
+          `INSERT INTO matches
+            (id, title, team_home, team_away, league, match_date, ticket_sales_close,
+             status, api_fixture_id, home_logo, away_logo, author_id)
+           VALUES (UUID(), ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+          [
+            `${teamHome} vs ${teamAway}`,
+            teamHome, teamAway,
+            fx.league || null,
+            matchDate, matchDate,
+            fixtureId || null,
+            fx.home_logo || null, fx.away_logo || null,
+            req.user.id,
+          ]
+        );
+        match = await queryOne('SELECT * FROM matches ORDER BY created_at DESC LIMIT 1');
+      }
+
+      // Mode 2: generate options from market category
+      let autoOptions = null;
+      if (prediction_type === 'market_type') {
+        autoOptions = generateOptions(market_type, teamHome, teamAway);
+      }
+
+      // Mode 3: fetch API-Football suggestion (best-effort, don't fail the whole batch)
+      let apiPick = null;
+      if (prediction_type === 'api_pick' && fixtureId) {
+        try {
+          const pred = await getFixturePredictions(fixtureId);
+          apiPick = pred?.predictions?.advice
+            || (pred?.predictions?.winner?.name ? `${pred.predictions.winner.name} to win` : null);
+        } catch { /* continue without pick */ }
+      }
+
+      const pickToStore = (prediction_type === 'market_pick' || prediction_type === 'api_pick')
+        ? apiPick
+        : null;
+
+      // Create one market row per tier
+      for (const tp of tiers) {
+        if (!tp.tier) continue;
+        // Skip if this tier already exists for this match+market_type
+        const existing = await queryOne(
+          'SELECT id FROM markets WHERE match_id = ? AND market_type = ? AND tier = ?',
+          [match.id, market_type, tp.tier]
+        );
+        if (existing) continue;
+
+        await execute(
+          `INSERT INTO markets
+            (id, match_id, market_type, prediction_type, admin_pick, auto_options,
+             tier, entry_fee, winner_count, staking_opens_at, staking_closes_at, status, created_at)
+           VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NOW())`,
+          [
+            match.id, market_type, prediction_type,
+            pickToStore,
+            autoOptions ? JSON.stringify(autoOptions) : null,
+            tp.tier,
+            parseInt(tp.entry_fee_points || 100),
+            parseInt(tp.winner_count || 1),
+            staking_opens_at || null,
+            staking_closes_at || null,
+          ]
+        );
+      }
+
+      results.created++;
+    } catch (err) {
+      results.skipped++;
+      results.errors.push({ fixture_id: fx.fixture_id, error: err.message });
+    }
+  }
+
+  auditLog(req.user.id, 'BULK_CREATE_MARKETS', null, { market_type, prediction_type, count: results.created });
+  return res.status(201).json({
+    success: true,
+    data: results,
+    message: `Bulk created ${results.created} match${results.created !== 1 ? 'es' : ''}, ${results.skipped} skipped`,
+  });
+});
+
 // ── GET /api/markets/predictions?fixture_id=:id ───────────────────────────────
 // Must be before /:id to avoid Express matching "predictions" as an ID
 router.get('/predictions', async (req, res) => {
@@ -146,11 +273,21 @@ router.get('/:id/options', async (req, res) => {
 });
 
 // ── POST /api/markets ──────────────────────────────────────────────────────────
+//
+// prediction_type controls which of the 3 modes is used:
+//   market_pick  (Mode 1) — analyst writes a specific pick; users vote YES or NO
+//   market_type  (Mode 2) — system auto-generates all standard options for the market
+//   api_pick     (Mode 3) — API-Football's suggested pick is fetched automatically;
+//                           users vote YES or NO against it
+//
+// When `tiers` array is provided, ONE market row is created per tier so the
+// frontend StakeModal can show exactly one card per tier (Silver / Gold / Platinum).
+//
 router.post('/', adminMiddleware, async (req, res) => {
   const {
     match_id, market_type, prediction_type = 'market_pick', admin_pick,
     tier, entry_fee, winner_count,
-    tiers,                  // array: [{tier, entry_fee_points, winner_count}]
+    tiers,               // [{tier, entry_fee_points, winner_count}]
     staking_opens_at, staking_closes_at,
   } = req.body;
 
@@ -169,13 +306,13 @@ router.post('/', adminMiddleware, async (req, res) => {
     const match = await queryOne('SELECT * FROM matches WHERE id = ?', [match_id]);
     if (!match) return res.status(404).json({ success: false, error: 'Match not found' });
 
-    // Generate auto_options for market_type
+    // ── Mode 2: generate all standard options for the chosen market category ──
     let autoOptions = null;
     if (prediction_type === 'market_type') {
       autoOptions = generateOptions(market_type, match.team_home, match.team_away);
     }
 
-    // For api_pick: auto-fetch API-Football's suggested prediction
+    // ── Mode 3: auto-fetch API-Football's suggested prediction ────────────────
     let resolvedAdminPick = admin_pick || null;
     if (prediction_type === 'api_pick' && match.api_fixture_id) {
       try {
@@ -185,57 +322,59 @@ router.post('/', adminMiddleware, async (req, res) => {
         } else if (pred?.predictions?.winner?.name) {
           resolvedAdminPick = `${pred.predictions.winner.name} to win`;
         }
-      } catch { /* use manual admin_pick if provided */ }
+      } catch { /* fall back to manual admin_pick */ }
     }
 
-    // Determine base tier/entry_fee for backward compatibility
-    const baseTier    = tier || (tiers && tiers[0]?.tier) || 'silver';
-    const baseEntryFee = entry_fee || (tiers && tiers[0]?.entry_fee_points) || 100;
-    const baseWinnerCount = winner_count || (tiers && tiers[0]?.winner_count) || 1;
+    // admin_pick is only stored for modes that use YES/NO binary voting
+    const pickToStore = (prediction_type === 'market_pick' || prediction_type === 'api_pick')
+      ? resolvedAdminPick
+      : null;
 
-    await execute(
-      `INSERT INTO markets
-        (id, match_id, market_type, prediction_type, admin_pick, auto_options, tier, entry_fee, winner_count,
-         staking_opens_at, staking_closes_at, status, created_at)
-       VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NOW())`,
-      [
-        match_id, market_type, prediction_type,
-        (prediction_type === 'market_pick' || prediction_type === 'api_pick') ? resolvedAdminPick : null,
-        autoOptions ? JSON.stringify(autoOptions) : null,
-        baseTier, parseInt(baseEntryFee), parseInt(baseWinnerCount),
-        staking_opens_at || null, staking_closes_at || null,
-      ]
-    );
+    // ── Build tier list ────────────────────────────────────────────────────────
+    // If `tiers` array provided, create one market row per tier.
+    // Otherwise fall back to a single market using the flat tier/entry_fee fields.
+    const tierList = (tiers && tiers.length > 0)
+      ? tiers
+      : [{ tier: tier || 'silver', entry_fee_points: entry_fee || 100, winner_count: winner_count || 1 }];
 
-    const market = await queryOne('SELECT * FROM markets ORDER BY created_at DESC LIMIT 1');
+    const createdIds = [];
 
-    // Create tier pools if tiers array provided
-    if (tiers && tiers.length > 0 && market) {
-      for (const tp of tiers) {
-        if (!tp.tier || !tp.entry_fee_points) continue;
-        await execute(
-          `INSERT INTO market_tier_pools (id, market_id, tier, entry_fee_points, winner_count, status)
-           VALUES (UUID(), ?, ?, ?, ?, 'open')
-           ON DUPLICATE KEY UPDATE entry_fee_points = VALUES(entry_fee_points), winner_count = VALUES(winner_count)`,
-          [market.id, tp.tier, parseInt(tp.entry_fee_points), parseInt(tp.winner_count) || 1]
-        );
-      }
-    } else if (market) {
-      // Create single tier pool from base values
+    for (const tp of tierList) {
+      if (!tp.tier) continue;
       await execute(
-        `INSERT INTO market_tier_pools (id, market_id, tier, entry_fee_points, winner_count, status)
-         VALUES (UUID(), ?, ?, ?, ?, 'open')
-         ON DUPLICATE KEY UPDATE entry_fee_points = VALUES(entry_fee_points)`,
-        [market.id, baseTier, parseInt(baseEntryFee), parseInt(baseWinnerCount)]
+        `INSERT INTO markets
+          (id, match_id, market_type, prediction_type, admin_pick, auto_options,
+           tier, entry_fee, winner_count, staking_opens_at, staking_closes_at, status, created_at)
+         VALUES (UUID(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NOW())`,
+        [
+          match_id, market_type, prediction_type,
+          pickToStore,
+          autoOptions ? JSON.stringify(autoOptions) : null,
+          tp.tier,
+          parseInt(tp.entry_fee_points || tp.entry_fee || 100),
+          parseInt(tp.winner_count || 1),
+          staking_opens_at || null,
+          staking_closes_at || null,
+        ]
       );
+
+      // Capture the UUID just inserted so we can return it
+      const inserted = await queryOne(
+        'SELECT id FROM markets WHERE match_id = ? AND tier = ? ORDER BY created_at DESC LIMIT 1',
+        [match_id, tp.tier]
+      );
+      if (inserted?.id) createdIds.push(inserted.id);
     }
 
-    const tierPools = await query('SELECT * FROM market_tier_pools WHERE market_id = ?', [market.id]);
+    const markets = createdIds.length
+      ? await query(`SELECT * FROM markets WHERE id IN (${createdIds.map(() => '?').join(',')})`, createdIds)
+      : [];
 
-    auditLog(req.user.id, 'CREATE_MARKET', market.id);
+    auditLog(req.user.id, 'CREATE_MARKET', createdIds.join(','));
     return res.status(201).json({
       success: true,
-      data: { market: { ...market, tier_pools: tierPools } },
+      data: { markets, market: markets[0] || null },
+      message: `${markets.length} market tier${markets.length !== 1 ? 's' : ''} created`,
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
