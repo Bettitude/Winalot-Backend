@@ -6,6 +6,13 @@ const { adminMiddleware, auditLog } = require('../middleware/admin');
 const { IS_MOCK }                   = require('../lib/mockMode');
 const { emailService }              = require('../services/email');
 const { smsService }                = require('../services/sms');
+const { supabaseAdmin }             = require('../lib/supabase');
+
+const IS_SUPABASE = !!(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_SERVICE_ROLE_KEY &&
+  !process.env.SUPABASE_URL.includes('your-')
+);
 
 // Generate WAL-YYYYMMDD-NNNNN ticket number
 async function genTicketNumber() {
@@ -85,11 +92,73 @@ router.get('/by-number/:number', async (req, res) => {
 
 // GET /api/tickets  (admin: all; user: own)
 router.get('/', authMiddleware, async (req, res) => {
-  if (IS_MOCK || !IS_DB_CONFIGURED) return res.json({ success: true, data: { tickets: [], total: 0 } });
+  if (IS_MOCK) return res.json({ success: true, data: { tickets: [], total: 0 } });
 
   const { page = 1, limit = 20, status, market_id } = req.query;
   const isAdmin = req.user.role === 'admin';
   const offset  = (parseInt(page) - 1) * parseInt(limit);
+
+  // ── Supabase path ──────────────────────────────────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      let q = supabaseAdmin
+        .from('btwin_tickets')
+        .select('id, ticket_number, user_id, market_id, user_prediction, amount_paid, status, prize_amount, created_at', { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .range(offset, offset + parseInt(limit) - 1);
+
+      if (!isAdmin) q = q.eq('user_id', req.user.id);
+      if (status)   q = q.eq('status', status);
+      if (market_id) q = q.eq('market_id', market_id);
+
+      const { data: rawTickets, count, error } = await q;
+      if (error) throw error;
+
+      const tickets = rawTickets || [];
+      if (!tickets.length) return res.json({ success: true, data: { tickets: [], total: 0 } });
+
+      // Enrich with market + match info + username
+      const marketIds = [...new Set(tickets.map(t => t.market_id).filter(Boolean))];
+      const userIds   = [...new Set(tickets.map(t => t.user_id).filter(Boolean))];
+
+      const [mkRes, uRes] = await Promise.all([
+        supabaseAdmin.from('btwin_markets').select('id, name, type, tier, ticket_price, match_id').in('id', marketIds),
+        supabaseAdmin.from('btwin_users').select('id, username').in('id', userIds),
+      ]);
+
+      const matchIds = [...new Set((mkRes.data || []).map(m => m.match_id).filter(Boolean))];
+      const maRes = matchIds.length
+        ? await supabaseAdmin.from('btwin_matches').select('id, team_home, team_away, league, match_date').in('id', matchIds)
+        : { data: [] };
+
+      const mkMap = Object.fromEntries((mkRes.data || []).map(m => [m.id, m]));
+      const maMap = Object.fromEntries((maRes.data || []).map(m => [m.id, m]));
+      const uMap  = Object.fromEntries((uRes.data  || []).map(u => [u.id, u]));
+
+      const enriched = tickets.map(t => {
+        const mk = mkMap[t.market_id] || {};
+        const ma = maMap[mk.match_id] || {};
+        const u  = uMap[t.user_id]    || {};
+        return {
+          ...t,
+          market_type: mk.type || mk.name,
+          tier:        mk.tier,
+          entry_fee:   mk.ticket_price,
+          team_home:   ma.team_home,
+          team_away:   ma.team_away,
+          league:      ma.league,
+          match_date:  ma.match_date,
+          username:    u.username,
+        };
+      });
+
+      return res.json({ success: true, data: { tickets: enriched, total: count || 0 } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
+  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { tickets: [], total: 0 } });
 
   try {
     let where = 'WHERE 1=1';
@@ -143,6 +212,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 // POST /api/tickets — purchase ticket (deducts BTP from wallet)
 router.post('/', authMiddleware, async (req, res) => {
   const { market_id, match_id, user_prediction, quantity = 1 } = req.body;
+  let totalCost = 0; // declared outside try so catch can use it for rollback
   if (!market_id || !match_id || !user_prediction) {
     return res.status(400).json({ success: false, error: 'market_id, match_id, user_prediction required' });
   }
@@ -171,17 +241,34 @@ router.post('/', authMiddleware, async (req, res) => {
     const market = await queryOne('SELECT * FROM markets WHERE id = ? AND status = "open"', [market_id]);
     if (!market) return res.status(404).json({ success: false, error: 'Market not found or closed' });
 
-    const totalCost = market.entry_fee * parseInt(quantity);
-    const user = await queryOne('SELECT wallet_balance FROM users WHERE id = ?', [req.user.id]);
-    if (!user || user.wallet_balance < totalCost) {
-      return res.status(400).json({ success: false, error: 'Insufficient BTP balance' });
+    totalCost = market.entry_fee * parseInt(quantity);
+
+    // Wallet lives on Supabase btwin_users — check balance there
+    let walletBalance = req.user.wallet_balance ?? 0;
+    if (IS_SUPABASE) {
+      const { data: walletRow } = await supabaseAdmin
+        .from('btwin_users')
+        .select('wallet_balance')
+        .eq('id', req.user.id)
+        .single();
+      walletBalance = walletRow?.wallet_balance ?? 0;
+    }
+    if (walletBalance < totalCost) {
+      return res.status(400).json({ success: false, error: 'Insufficient wallet balance' });
+    }
+
+    // Deduct wallet on Supabase first (atomic RPC)
+    if (IS_SUPABASE) {
+      const { error: debitErr } = await supabaseAdmin
+        .rpc('btwin_debit_wallet', { p_user_id: req.user.id, p_amount: totalCost });
+      if (debitErr) {
+        return res.status(400).json({ success: false, error: debitErr.message || 'Wallet deduction failed' });
+      }
     }
 
     const ticketNumber = await genTicketNumber();
 
     const ticket = await transaction(async (conn) => {
-      // Deduct wallet
-      await conn.execute('UPDATE users SET wallet_balance = wallet_balance - ? WHERE id = ?', [totalCost, req.user.id]);
 
       // Insert ticket
       await conn.execute(
@@ -204,12 +291,28 @@ router.post('/', authMiddleware, async (req, res) => {
       return row[0];
     });
 
+    // Log deduction in Supabase btwin_transactions for wallet history
+    if (IS_SUPABASE) {
+      supabaseAdmin.from('btwin_transactions').insert({
+        user_id:     req.user.id,
+        type:        'ticket_purchase',
+        amount:      -totalCost,
+        status:      'completed',
+        reference:   ticketNumber,
+        description: `Staking ticket — ${market.market_type} (${market.tier})`,
+      }).catch(() => {});
+    }
+
     emailService.sendTicketConfirmation(req.user, ticket).catch(() => {});
     smsService.sendTicketConfirmation(req.user.phone, ticket).catch(() => {});
 
     return res.status(201).json({ success: true, data: { ticket }, message: 'Ticket purchased successfully' });
   } catch (err) {
     console.error('[tickets/purchase]', err.message);
+    // MySQL transaction failed after wallet was already debited — refund best-effort
+    if (IS_SUPABASE && totalCost > 0) {
+      supabaseAdmin.rpc('btwin_credit_wallet', { p_user_id: req.user.id, p_amount: totalCost }).catch(() => {});
+    }
     return res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -222,8 +325,10 @@ router.delete('/:id', adminMiddleware, async (req, res) => {
     const ticket = await queryOne('SELECT * FROM tickets WHERE id = ?', [req.params.id]);
     if (!ticket) return res.status(404).json({ success: false, error: 'Ticket not found' });
 
-    // Refund wallet
-    await execute('UPDATE users SET wallet_balance = wallet_balance + ? WHERE id = ?', [ticket.amount_paid, ticket.user_id]);
+    // Refund wallet on Supabase
+    if (IS_SUPABASE) {
+      await supabaseAdmin.rpc('btwin_credit_wallet', { p_user_id: ticket.user_id, p_amount: ticket.amount_paid }).catch(() => {});
+    }
     await execute('UPDATE tickets SET status = "refunded" WHERE id = ?', [ticket.id]);
     await execute('INSERT INTO transactions (id, user_id, type, amount, reference, status, metadata) VALUES (UUID(), ?, "refund", ?, ?, "successful", ?)',
       [ticket.user_id, ticket.amount_paid, `VOID-${ticket.ticket_number}`, JSON.stringify({ admin_id: req.user.id })]);

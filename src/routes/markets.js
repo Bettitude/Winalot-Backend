@@ -216,6 +216,42 @@ router.get('/predictions', async (req, res) => {
   }
 });
 
+// ── GET /api/markets/fixture/:fixtureId — by API-Football fixture ID ──────────
+// Returns all markets whose parent match has api_fixture_id = fixtureId
+router.get('/fixture/:fixtureId', async (req, res) => {
+  const { fixtureId } = req.params;
+
+  if (IS_MOCK || !IS_DB_CONFIGURED) {
+    return res.json({ success: true, data: { markets: [], total: 0 } });
+  }
+
+  try {
+    const match = await queryOne('SELECT * FROM matches WHERE api_fixture_id = ?', [fixtureId]);
+    if (!match) return res.json({ success: true, data: { markets: [], total: 0 } });
+
+    const markets = await query(
+      `SELECT m.*,
+         (SELECT COUNT(*) FROM tickets t
+          WHERE t.market_id = m.id AND t.status NOT IN ('voided','refunded')) AS total_entries
+       FROM markets m
+       WHERE m.match_id = ?
+       ORDER BY FIELD(m.tier, 'silver', 'gold', 'platinum'), m.created_at ASC`,
+      [match.id]
+    );
+
+    const result = markets.map(m => ({
+      ...m,
+      auto_options: m.auto_options
+        ? (typeof m.auto_options === 'string' ? JSON.parse(m.auto_options) : m.auto_options)
+        : null,
+    }));
+
+    return res.json({ success: true, data: { markets: result, total: result.length } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── GET /api/markets/:id ───────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   if (IS_MOCK) return res.status(404).json({ success: false, error: 'No market found in mock mode' });

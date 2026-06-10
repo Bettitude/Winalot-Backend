@@ -5,13 +5,44 @@ const { authMiddleware }  = require('../middleware/auth');
 const { adminMiddleware } = require('../middleware/admin');
 const { paymentService }  = require('../services/payment');
 const { authLimiter }     = require('../middleware/rateLimiter');
+const { supabaseAdmin }   = require('../lib/supabase');
+
+const IS_SUPABASE = !!(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_SERVICE_ROLE_KEY &&
+  !process.env.SUPABASE_URL.includes('your-')
+);
 
 // GET /api/transactions
 router.get('/', authMiddleware, async (req, res) => {
-  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { transactions: [], total: 0 } });
   const { type, status, page = 1, limit = 20 } = req.query;
   const isAdmin = req.user.role === 'admin';
   const offset  = (parseInt(page) - 1) * parseInt(limit);
+
+  // ── Supabase path ──────────────────────────────────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      let q = supabaseAdmin
+        .from('btwin_transactions')
+        .select('id, user_id, type, amount, reference, status, description, created_at', { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .range(offset, offset + parseInt(limit) - 1);
+
+      if (!isAdmin) q = q.eq('user_id', req.user.id);
+      if (type)     q = q.eq('type', type);
+      if (status)   q = q.eq('status', status);
+
+      const { data: transactions, count, error } = await q;
+      if (error) throw error;
+
+      return res.json({ success: true, data: { transactions: transactions || [], total: count || 0 } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
+  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { transactions: [], total: 0 } });
+
   try {
     let where = 'WHERE 1=1';
     const params = [];

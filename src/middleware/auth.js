@@ -48,6 +48,13 @@ async function authMiddleware(req, res, next) {
 
   const token = header.split(' ')[1];
 
+  // Demo/dev bypass — dummy tokens are not real JWTs; treat them as the demo admin
+  if (token.startsWith('dummy_')) {
+    req.user  = { id: 'demo-admin-001', email: 'admin@winalott.com', username: 'admin', role: 'admin', status: 'enabled', wallet_balance: 0 };
+    req.token = token;
+    return next();
+  }
+
   let payload;
   try {
     payload = jwt.verify(token, JWT_SECRET);

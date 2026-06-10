@@ -5,6 +5,13 @@ const { authMiddleware }            = require('../middleware/auth');
 const { adminMiddleware, auditLog } = require('../middleware/admin');
 const { emailService }              = require('../services/email');
 const { smsService }                = require('../services/sms');
+const { supabaseAdmin }             = require('../lib/supabase');
+
+const IS_SUPABASE = !!(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_SERVICE_ROLE_KEY &&
+  !process.env.SUPABASE_URL.includes('your-')
+);
 
 // GET /api/notifications
 router.get('/', authMiddleware, async (req, res) => {
@@ -59,6 +66,36 @@ router.post('/push', adminMiddleware, async (req, res) => {
   const { title, message, target = 'all', user_ids, channels = ['in_app'] } = req.body;
   if (!title || !message) return res.status(400).json({ success: false, error: 'title and message required' });
 
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      let users = [];
+      if (target === 'all') {
+        const { data } = await supabaseAdmin.from('btwin_users').select('id, email, phone').eq('status', 'enabled');
+        users = data || [];
+      } else if (target === 'selected' && user_ids?.length) {
+        const { data } = await supabaseAdmin.from('btwin_users').select('id, email, phone').in('id', user_ids);
+        users = data || [];
+      }
+
+      if (users.length && channels.includes('in_app')) {
+        const rows = users.map(u => ({ user_id: u.id, title, message, type: 'info', read: false }));
+        await supabaseAdmin.from('btwin_notifications').insert(rows);
+      }
+
+      await supabaseAdmin.from('btwin_notification_history').insert({
+        title, message, channels, target, recipient_count: users.length, sent_by: req.user.id,
+      });
+
+      if (channels.includes('email')) users.forEach(u => emailService.sendNotification?.(u, title, message)?.catch(() => {}));
+      if (channels.includes('sms'))   users.forEach(u => u.phone && smsService.sendNotification?.(u.phone, `${title}: ${message}`)?.catch(() => {}));
+
+      auditLog(req.user.id, 'PUSH_NOTIFICATION', null, null, { title, target, recipient_count: users.length });
+      return res.json({ success: true, data: { recipient_count: users.length }, message: 'Notification sent' });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { recipient_count: 0 }, message: 'Notification pushed (mock)' });
 
   try {
@@ -101,6 +138,18 @@ router.post('/push', adminMiddleware, async (req, res) => {
 
 // GET /api/notifications/history  (admin)
 router.get('/history', adminMiddleware, async (req, res) => {
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data } = await supabaseAdmin
+        .from('btwin_notification_history')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(50);
+      return res.json({ success: true, data: { history: data || [] } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { history: [] } });
 
   try {
@@ -113,6 +162,17 @@ router.get('/history', adminMiddleware, async (req, res) => {
 
 // GET /api/notifications/templates  (admin)
 router.get('/templates', adminMiddleware, async (req, res) => {
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data } = await supabaseAdmin
+        .from('btwin_notification_templates')
+        .select('*')
+        .order('created_at', { ascending: false });
+      return res.json({ success: true, data: { templates: data || [] } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { templates: [] } });
 
   try {
@@ -125,8 +185,22 @@ router.get('/templates', adminMiddleware, async (req, res) => {
 
 // POST /api/notifications/templates  (admin)
 router.post('/templates', adminMiddleware, async (req, res) => {
-  const { title, message } = req.body;
+  const { title, message, channels } = req.body;
   if (!title || !message) return res.status(400).json({ success: false, error: 'title and message required' });
+
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('btwin_notification_templates')
+        .insert({ title, message, channels: channels || { in_app: true, email: false, sms: false }, created_by: req.user.id })
+        .select()
+        .single();
+      if (error) throw error;
+      return res.status(201).json({ success: true, data: { template: data } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
   if (!IS_DB_CONFIGURED) return res.status(201).json({ success: true, data: { template: { id: `mock-${Date.now()}`, title, message } } });
 
   try {

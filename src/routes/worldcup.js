@@ -35,15 +35,29 @@ const MOCK_WC_FIXTURES = [
 
 // ── DB helpers ────────────────────────────────────────────────────────────────
 
+async function dbEnrichWithCounts(games) {
+  if (!games?.length) return games || [];
+  const gameIds = games.map(g => g.id);
+  const { data: entries } = await supabaseAdmin
+    .from('btwin_wc_entries')
+    .select('game_id')
+    .in('game_id', gameIds);
+  const countMap = {};
+  for (const e of (entries || [])) {
+    countMap[e.game_id] = (countMap[e.game_id] || 0) + 1;
+  }
+  return games.map(g => ({ ...g, entry_count: countMap[g.id] || 0 }));
+}
+
 async function dbGetGamesMap() {
   const { data, error } = await supabaseAdmin
     .from('btwin_wc_games')
-    .select('fixture_id, id, question, options, correct_option, prize_type, prize_usd, prize_cents, prize_description, winner_count, status, entry_count:btwin_wc_entries(count)');
+    .select('id, fixture_id, question, options, correct_option, prize_type, prize_usd, prize_cents, prize_description, winner_count, status');
   if (error) throw error;
+  const enriched = await dbEnrichWithCounts(data || []);
   const map = new Map();
-  for (const g of (data || [])) {
-    const entry_count = parseInt(g.entry_count?.[0]?.count || 0);
-    map.set(String(g.fixture_id), { ...g, entry_count, btwin_wc_entries: undefined });
+  for (const g of enriched) {
+    map.set(String(g.fixture_id), g);
   }
   return map;
 }
@@ -51,24 +65,26 @@ async function dbGetGamesMap() {
 async function dbGetGame(fixtureId) {
   const { data, error } = await supabaseAdmin
     .from('btwin_wc_games')
-    .select('*, entries:btwin_wc_entries(id, user_id, username, email, option_key)')
+    .select('*')
     .eq('fixture_id', String(fixtureId))
     .maybeSingle();
   if (error) throw error;
-  return data ? { ...data, entries: data.entries || [] } : null;
+  if (!data) return null;
+
+  const { data: entries } = await supabaseAdmin
+    .from('btwin_wc_entries')
+    .select('id, user_id, username, email, option_key')
+    .eq('game_id', data.id);
+  return { ...data, entries: entries || [] };
 }
 
 async function dbGetAllGames() {
   const { data, error } = await supabaseAdmin
     .from('btwin_wc_games')
-    .select('*, entry_count:btwin_wc_entries(count)')
+    .select('*')
     .order('match_date', { ascending: true, nullsFirst: false });
   if (error) throw error;
-  return (data || []).map(g => ({
-    ...g,
-    entry_count:       parseInt(g.entry_count?.[0]?.count || 0),
-    entry_count_alias: undefined,
-  }));
+  return dbEnrichWithCounts(data || []);
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -203,8 +219,15 @@ router.post('/games', adminMiddleware, async (req, res) => {
         .maybeSingle();
       if (existing) return res.status(409).json({ success: false, error: 'A free game already exists for this fixture' });
 
-      const { error } = await supabaseAdmin.from('btwin_wc_games').insert(game);
+      // Strip non-UUID id and demo-user created_by before DB insert
+      const { id: _id, created_by: _cb, created_at: _ca, ...dbPayload } = game;
+      const { data: inserted, error } = await supabaseAdmin
+        .from('btwin_wc_games')
+        .insert(dbPayload)
+        .select()
+        .single();
       if (error) throw error;
+      return res.status(201).json({ success: true, data: sanitizeGame(inserted) });
     } else {
       if (wcGames.has(key)) return res.status(409).json({ success: false, error: 'A free game already exists for this fixture' });
       wcGames.set(key, { ...game, entries: [], winners: null });

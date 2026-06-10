@@ -3,6 +3,13 @@ const router  = express.Router();
 const { query, queryOne, execute, IS_DB_CONFIGURED } = require('../lib/db');
 const { authMiddleware }            = require('../middleware/auth');
 const { adminMiddleware, auditLog } = require('../middleware/admin');
+const { supabaseAdmin }             = require('../lib/supabase');
+
+const IS_SUPABASE = !!(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_SERVICE_ROLE_KEY &&
+  !process.env.SUPABASE_URL.includes('your-')
+);
 
 // GET /api/users/me — current authenticated user
 router.get('/me', authMiddleware, async (req, res) => {
@@ -157,12 +164,34 @@ router.get('/leaderboard', async (req, res) => {
 
 // GET /api/users  (admin)
 router.get('/', adminMiddleware, async (req, res) => {
+  const { page = 1, limit = 20, search, status, role } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+
+  // ── Supabase path ──────────────────────────────────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      let q = supabaseAdmin
+        .from('btwin_users')
+        .select('id, username, full_name, email, phone, role, status, wallet_balance, created_at', { count: 'exact' })
+        .order('created_at', { ascending: false })
+        .range(offset, offset + parseInt(limit) - 1);
+
+      if (status) q = q.eq('status', status);
+      if (role)   q = q.eq('role', role);
+      if (search) q = q.or(`username.ilike.%${search}%,email.ilike.%${search}%,full_name.ilike.%${search}%`);
+
+      const { data: users, count, error } = await q;
+      if (error) throw error;
+
+      return res.json({ success: true, data: { users: users || [], total: count || 0 } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { users: [], total: 0 } });
 
   try {
-    const { page = 1, limit = 20, search, status, role } = req.query;
-    const offset = (parseInt(page) - 1) * parseInt(limit);
-
     let where = 'WHERE 1=1';
     const params = [];
     if (search) { where += ' AND (username LIKE ? OR email LIKE ? OR full_name LIKE ?)'; params.push(`%${search}%`, `%${search}%`, `%${search}%`); }
@@ -186,6 +215,19 @@ router.get('/:id', authMiddleware, async (req, res) => {
   const isSelf  = req.user.id === req.params.id;
   if (!isAdmin && !isSelf) return res.status(403).json({ success: false, error: 'Forbidden' });
 
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data: user, error } = await supabaseAdmin
+        .from('btwin_users')
+        .select('id, username, full_name, email, phone, avatar_url, role, status, wallet_balance, created_at')
+        .eq('id', req.params.id)
+        .single();
+      if (error || !user) return res.status(404).json({ success: false, error: 'User not found' });
+      return res.json({ success: true, data: { user } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { user: req.user } });
 
   try {
@@ -214,6 +256,21 @@ router.patch('/:id', authMiddleware, async (req, res) => {
   for (const k of allowed) { if (req.body[k] !== undefined) updates[k] = req.body[k]; }
   if (!Object.keys(updates).length) return res.status(400).json({ success: false, error: 'No valid fields to update' });
 
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data: user, error } = await supabaseAdmin
+        .from('btwin_users')
+        .update(updates)
+        .eq('id', req.params.id)
+        .select('id, username, full_name, email, phone, role, status, wallet_balance, created_at')
+        .single();
+      if (error) throw error;
+      if (isAdmin) auditLog(req.user.id, 'UPDATE_USER', 'user', req.params.id, updates);
+      return res.json({ success: true, data: { user } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { user: { ...req.user, ...updates } } });
 
   try {

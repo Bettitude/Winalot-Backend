@@ -7,6 +7,13 @@ const { cacheMiddleware }           = require('../middleware/cache');
 const { apiFootball }               = require('../services/apiFootball');
 const { IS_MOCK, fixtureToMatch }   = require('../lib/mockMode');
 const { getTodayFixtures, getUpcomingFixtures, getFixtureById } = require('../services/footballService');
+const { supabaseAdmin }             = require('../lib/supabase');
+
+const IS_SUPABASE = !!(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_SERVICE_ROLE_KEY &&
+  !process.env.SUPABASE_URL.includes('your-')
+);
 
 const POPULAR_LEAGUE_IDS = new Set([
   2, 3, 848, 1, 4, 9,
@@ -40,6 +47,65 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
   }
 
   const { status = 'active', league, page = 1, limit = 20 } = req.query;
+
+  // ── Supabase path ──────────────────────────────────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    try {
+      let q = supabaseAdmin
+        .from('btwin_matches')
+        .select('id, title, team_home, team_away, league, stadium, match_date, status, api_football_id', { count: 'exact' })
+        .order('match_date', { ascending: true })
+        .range(offset, offset + parseInt(limit) - 1);
+
+      if (status !== 'all') q = q.eq('status', status);
+      if (league)           q = q.eq('league', league);
+
+      const { data: rawMatches, count, error } = await q;
+      if (error) throw error;
+
+      const matchIds = (rawMatches || []).map(m => m.id);
+      let marketsMap = {};
+      if (matchIds.length) {
+        const { data: mkData } = await supabaseAdmin
+          .from('btwin_markets')
+          .select('id, match_id, name, type, tier, ticket_price, status, options, correct_prediction')
+          .in('match_id', matchIds);
+
+        // Count tickets per market for fill_percent / total_entries
+        const marketIdList = (mkData || []).map(m => m.id);
+        let ticketCounts = {};
+        if (marketIdList.length) {
+          const { data: tcData } = await supabaseAdmin
+            .from('btwin_tickets')
+            .select('market_id')
+            .in('market_id', marketIdList);
+          for (const t of (tcData || [])) {
+            ticketCounts[t.market_id] = (ticketCounts[t.market_id] || 0) + 1;
+          }
+        }
+
+        for (const mk of (mkData || [])) {
+          if (!marketsMap[mk.match_id]) marketsMap[mk.match_id] = [];
+          marketsMap[mk.match_id].push({
+            ...mk,
+            total_entries: ticketCounts[mk.id] || 0,
+          });
+        }
+      }
+
+      const matches = (rawMatches || []).map(m => ({
+        ...m,
+        markets:       marketsMap[m.id] || [],
+        total_entries: (marketsMap[m.id] || []).reduce((s, mk) => s + (mk.total_entries || 0), 0),
+      }));
+
+      return res.json({ success: true, data: { matches, total: count || 0, page: parseInt(page), limit: parseInt(limit) } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
   try {
