@@ -127,21 +127,120 @@ router.delete('/me/payment-methods/:id', authMiddleware, async (req, res) => {
   }
 });
 
+// GET /api/users/leaderboard-stats — public, aggregated numbers for the stats bar
+router.get('/leaderboard-stats', async (req, res) => {
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString();
+
+      const [usersRes, allTicketsRes, wonTicketsRes, weekWonRes] = await Promise.all([
+        supabaseAdmin.from('btwin_users').select('*', { count: 'exact', head: true }),
+        supabaseAdmin.from('btwin_tickets').select('*', { count: 'exact', head: true }),
+        supabaseAdmin.from('btwin_tickets').select('prize_amount').eq('status', 'won').gt('prize_amount', 0),
+        supabaseAdmin.from('btwin_tickets').select('user_id').eq('status', 'won').gte('created_at', weekAgo),
+      ]);
+
+      const totalPlayers   = usersRes.count  || 0;
+      const totalTickets   = allTicketsRes.count || 0;
+      const totalPaidOut   = (wonTicketsRes.data || []).reduce((s, t) => s + (t.prize_amount || 0), 0);
+      const weekWinners    = new Set((weekWonRes.data || []).map(t => t.user_id)).size;
+      const wonCount       = (wonTicketsRes.data || []).length;
+      const avgWinRate     = totalTickets > 0 ? Math.round((wonCount / totalTickets) * 100) : 0;
+
+      return res.json({ success: true, data: { total_players: totalPlayers, total_paid_out: totalPaidOut, winners_this_week: weekWinners, avg_win_rate: avgWinRate } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+  // MySQL fallback
+  if (IS_DB_CONFIGURED) {
+    try {
+      const weekAgo = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 19).replace('T', ' ');
+      const [[{ total_players }], [{ total_paid_out }], [{ winners_this_week }], [{ total_tickets }], [{ won_tickets }]] = await Promise.all([
+        query('SELECT COUNT(*) AS total_players FROM users'),
+        query("SELECT COALESCE(SUM(prize_amount),0) AS total_paid_out FROM tickets WHERE status='won'"),
+        query(`SELECT COUNT(DISTINCT user_id) AS winners_this_week FROM tickets WHERE status='won' AND created_at >= ?`, [weekAgo]),
+        query('SELECT COUNT(*) AS total_tickets FROM tickets'),
+        query("SELECT COUNT(*) AS won_tickets FROM tickets WHERE status='won'"),
+      ]);
+      const avg_win_rate = total_tickets > 0 ? Math.round((won_tickets / total_tickets) * 100) : 0;
+      return res.json({ success: true, data: { total_players, total_paid_out, winners_this_week, avg_win_rate } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+  return res.json({ success: true, data: { total_players: 0, total_paid_out: 0, winners_this_week: 0, avg_win_rate: 0 } });
+});
+
 // GET /api/users/leaderboard — public
 router.get('/leaderboard', async (req, res) => {
   const period = req.query.period || 'weekly';
+
+  // ── Supabase path ──────────────────────────────────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      let q = supabaseAdmin
+        .from('btwin_tickets')
+        .select('user_id, prize_amount, created_at')
+        .eq('status', 'won')
+        .gt('prize_amount', 0);
+
+      if (period !== 'alltime') {
+        const days = period === 'monthly' ? 30 : 7;
+        const since = new Date(Date.now() - days * 86400000).toISOString();
+        q = q.gte('created_at', since);
+      }
+
+      const { data: tickets, error: tErr } = await q;
+      if (tErr) throw tErr;
+
+      if (!tickets || tickets.length === 0) {
+        return res.json({ success: true, data: { leaderboard: [] } });
+      }
+
+      // Aggregate by user_id
+      const userMap = new Map();
+      for (const t of tickets) {
+        if (!userMap.has(t.user_id)) userMap.set(t.user_id, { total_wins: 0, total_won: 0 });
+        const e = userMap.get(t.user_id);
+        e.total_wins++;
+        e.total_won += t.prize_amount || 0;
+      }
+
+      // Fetch usernames
+      const userIds = Array.from(userMap.keys());
+      const { data: users, error: uErr } = await supabaseAdmin
+        .from('btwin_users')
+        .select('id, username')
+        .in('id', userIds);
+      if (uErr) throw uErr;
+
+      const usernameMap = Object.fromEntries((users || []).map(u => [u.id, u.username]));
+
+      const leaderboard = Array.from(userMap.entries())
+        .map(([uid, stats]) => ({ username: usernameMap[uid] || 'Unknown', ...stats }))
+        .sort((a, b) => b.total_won - a.total_won)
+        .slice(0, 50)
+        .map((r, i) => ({ ...r, rank: i + 1 }));
+
+      return res.json({ success: true, data: { leaderboard } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   if (!IS_DB_CONFIGURED) {
     const mock = Array.from({ length: 10 }, (_, i) => ({
       rank: i + 1,
       username: `player_${i + 1}`,
       total_wins: 10 - i,
-      total_won:  (10 - i) * 250,
+      total_won:  (10 - i) * 25000, // cents
     }));
     return res.json({ success: true, data: { leaderboard: mock } });
   }
 
   try {
-    const dateFilter = period === 'monthly'
+    const dateFilter = period === 'alltime' ? '' : period === 'monthly'
       ? "AND t.updated_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
       : "AND t.updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)";
 
@@ -160,6 +259,60 @@ router.get('/leaderboard', async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// GET /api/users/me/payout-details
+router.get('/me/payout-details', authMiddleware, async (req, res) => {
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    const { data, error } = await supabaseAdmin
+      .from('btwin_payout_details')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .maybeSingle();
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, data: { details: data || null } });
+  }
+  return res.json({ success: true, data: { details: null } });
+});
+
+// PUT /api/users/me/payout-details
+router.put('/me/payout-details', authMiddleware, async (req, res) => {
+  const { bank_name, account_name, account_number, bank_code, currency } = req.body;
+  if (!bank_name || !account_name || !account_number) {
+    return res.status(400).json({ success: false, error: 'bank_name, account_name, and account_number are required' });
+  }
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    const { data, error } = await supabaseAdmin
+      .from('btwin_payout_details')
+      .upsert({
+        user_id:        req.user.id,
+        bank_name,
+        account_name,
+        account_number,
+        bank_code:      bank_code  || null,
+        currency:       currency   || 'NGN',
+        updated_at:     new Date().toISOString(),
+      }, { onConflict: 'user_id' })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, data: { details: data } });
+  }
+  return res.json({ success: true, data: { details: { bank_name, account_name, account_number, bank_code, currency } } });
+});
+
+// GET /api/users/:id/payout-details — admin only
+router.get('/:id/payout-details', adminMiddleware, async (req, res) => {
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    const { data, error } = await supabaseAdmin
+      .from('btwin_payout_details')
+      .select('*')
+      .eq('user_id', req.params.id)
+      .maybeSingle();
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    return res.json({ success: true, data: { details: data || null } });
+  }
+  return res.json({ success: true, data: { details: null } });
 });
 
 // GET /api/users  (admin)

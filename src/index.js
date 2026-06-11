@@ -25,6 +25,7 @@ const worldcupRoutes      = require('./routes/worldcup');
 const analyticsRoutes     = require('./routes/analytics');
 const adminStatsRoutes    = require('./routes/adminStats');
 const referralRoutes      = require('./routes/referrals');
+const btpSettingsRoutes   = require('./routes/btpSettings');
 
 const app    = express();
 const server = http.createServer(app);
@@ -109,6 +110,7 @@ app.use('/api/worldcup',     worldcupRoutes);
 app.use('/api/analytics',    analyticsRoutes);
 app.use('/api/admin/stats',  adminStatsRoutes);
 app.use('/api/referrals',   referralRoutes);
+app.use('/api/btp-settings', btpSettingsRoutes);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ success: false, error: 'Route not found' }));

@@ -217,6 +217,103 @@ router.post('/', authMiddleware, async (req, res) => {
     return res.status(400).json({ success: false, error: 'market_id, match_id, user_prediction required' });
   }
 
+  // ── Supabase-only path (MySQL not configured) ─────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      // Get market
+      const { data: market, error: mErr } = await supabaseAdmin
+        .from('btwin_markets')
+        .select('id, match_id, name, tier, ticket_price, status, winner_count, prize_pool')
+        .eq('id', market_id)
+        .single();
+      if (mErr || !market) return res.status(404).json({ success: false, error: 'Market not found' });
+      if (market.status !== 'active') return res.status(400).json({ success: false, error: 'Market is not open for staking' });
+
+      // Check match timing
+      const { data: matchRow } = await supabaseAdmin
+        .from('btwin_matches')
+        .select('match_date, status')
+        .eq('id', market.match_id)
+        .maybeSingle();
+      if (matchRow) {
+        if (['finished', 'live'].includes(matchRow.status)) {
+          return res.status(400).json({ success: false, error: 'Staking is closed for this match' });
+        }
+        if (Date.now() >= new Date(matchRow.match_date).getTime() - 5 * 60 * 1000) {
+          return res.status(400).json({ success: false, error: 'Staking window closed (5 min before kickoff)' });
+        }
+      }
+
+      const amount = market.ticket_price;
+
+      // Check wallet balance
+      const { data: walletRow } = await supabaseAdmin
+        .from('btwin_users')
+        .select('wallet_balance')
+        .eq('id', req.user.id)
+        .single();
+      if (!walletRow || walletRow.wallet_balance < amount) {
+        return res.status(400).json({ success: false, error: 'Insufficient wallet balance' });
+      }
+
+      // Debit wallet (atomic RPC)
+      const { error: debitErr } = await supabaseAdmin
+        .rpc('btwin_debit_wallet', { p_user_id: req.user.id, p_amount: amount });
+      if (debitErr) return res.status(400).json({ success: false, error: debitErr.message || 'Wallet deduction failed' });
+
+      // Generate ticket number
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      const { count: ticketCount } = await supabaseAdmin
+        .from('btwin_tickets').select('*', { count: 'exact', head: true });
+      const ticketNumber = `WAL-${today}-${String((ticketCount || 0) + 1).padStart(5, '0')}`;
+
+      // Create ticket
+      const { data: ticket, error: tErr } = await supabaseAdmin
+        .from('btwin_tickets')
+        .insert({
+          user_id:         req.user.id,
+          market_id,
+          ticket_number:   ticketNumber,
+          user_prediction,
+          amount_paid:     amount,
+          status:          'active',
+        })
+        .select()
+        .single();
+
+      if (tErr) {
+        supabaseAdmin.rpc('btwin_credit_wallet', { p_user_id: req.user.id, p_amount: amount }).catch(() => {});
+        throw tErr;
+      }
+
+      // Update market prize pool
+      supabaseAdmin
+        .from('btwin_markets')
+        .update({ prize_pool: (market.prize_pool || 0) + amount })
+        .eq('id', market_id)
+        .then(() => {})
+        .catch(() => {});
+
+      // Log transaction
+      supabaseAdmin.from('btwin_transactions').insert({
+        user_id:     req.user.id,
+        type:        'ticket_purchase',
+        amount:      -amount,
+        status:      'completed',
+        reference:   ticketNumber,
+        description: `Stake — ${market.name} (${market.tier})`,
+      }).catch(() => {});
+
+      emailService.sendTicketConfirmation(req.user, ticket).catch(() => {});
+      if (req.user.phone) smsService.sendTicketConfirmation(req.user.phone, ticket).catch(() => {});
+
+      return res.status(201).json({ success: true, data: { ticket }, message: 'Ticket purchased successfully' });
+    } catch (err) {
+      console.error('[tickets/purchase/supabase]', err.message);
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   if (IS_MOCK || !IS_DB_CONFIGURED) {
     const ticketNumber = await genTicketNumber();
     const mockTicket = { id: `mock-${Date.now()}`, ticket_number: ticketNumber, user_id: req.user.id, market_id, match_id, user_prediction, amount_paid: 100, status: 'pending', purchased_at: new Date().toISOString() };

@@ -6,6 +6,14 @@ const { cacheMiddleware }           = require('../middleware/cache');
 const { IS_MOCK, fixtureToMatch }   = require('../lib/mockMode');
 const { getFixtureById, getFixturePredictions } = require('../services/footballService');
 const { generateOptions, identifyCorrectOption } = require('../services/marketOptions');
+const { supabaseAdmin }             = require('../lib/supabase');
+
+const IS_SUPABASE = !!(
+  process.env.SUPABASE_URL &&
+  process.env.SUPABASE_SERVICE_ROLE_KEY &&
+  !process.env.SUPABASE_URL.includes('your-')
+);
+const TIER_ORDER = ['silver', 'gold', 'platinum'];
 
 // ── GET /api/markets ───────────────────────────────────────────────────────────
 router.get('/', cacheMiddleware(60), async (req, res) => {
@@ -217,9 +225,57 @@ router.get('/predictions', async (req, res) => {
 });
 
 // ── GET /api/markets/fixture/:fixtureId — by API-Football fixture ID ──────────
-// Returns all markets whose parent match has api_fixture_id = fixtureId
 router.get('/fixture/:fixtureId', async (req, res) => {
   const { fixtureId } = req.params;
+
+  // ── Supabase path ──────────────────────────────────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data: match } = await supabaseAdmin
+        .from('btwin_matches')
+        .select('id, team_home, team_away')
+        .eq('api_football_id', Number(fixtureId))
+        .maybeSingle();
+
+      if (!match) return res.json({ success: true, data: { markets: [], total: 0 } });
+
+      const { data: markets } = await supabaseAdmin
+        .from('btwin_markets')
+        .select('*')
+        .eq('match_id', match.id)
+        .eq('status', 'active');
+
+      if (!markets?.length) return res.json({ success: true, data: { markets: [], total: 0 } });
+
+      // Count tickets per market in one query
+      const { data: ticketRows } = await supabaseAdmin
+        .from('btwin_tickets')
+        .select('market_id')
+        .in('market_id', markets.map(m => m.id))
+        .neq('status', 'voided');
+
+      const countMap = {};
+      (ticketRows || []).forEach(t => { countMap[t.market_id] = (countMap[t.market_id] || 0) + 1; });
+
+      const result = markets
+        .sort((a, b) => TIER_ORDER.indexOf(a.tier) - TIER_ORDER.indexOf(b.tier))
+        .map(m => ({
+          ...m,
+          entry_fee:     m.ticket_price,
+          market_type:   m.type,
+          team_home:     match.team_home,
+          team_away:     match.team_away,
+          auto_options:  Array.isArray(m.options) ? m.options
+                         : (m.options ? JSON.parse(m.options) : []),
+          total_entries: countMap[m.id] || 0,
+        }));
+
+      return res.json({ success: true, data: { markets: result, total: result.length } });
+    } catch (err) {
+      console.error('[markets/fixture/supabase]', err.message);
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
 
   if (IS_MOCK || !IS_DB_CONFIGURED) {
     return res.json({ success: true, data: { markets: [], total: 0 } });

@@ -196,7 +196,7 @@ router.post('/games', adminMiddleware, async (req, res) => {
     fixture_id:        key,
     home_team:         home_team  || '',
     away_team:         away_team  || '',
-    match_date:        match_date || null,
+    match_date:        match_date ? match_date.replace(' ', '+') : null,
     question,
     options,
     correct_option:    null,
@@ -219,8 +219,9 @@ router.post('/games', adminMiddleware, async (req, res) => {
         .maybeSingle();
       if (existing) return res.status(409).json({ success: false, error: 'A free game already exists for this fixture' });
 
-      // Strip non-UUID id and demo-user created_by before DB insert
-      const { id: _id, created_by: _cb, created_at: _ca, ...dbPayload } = game;
+      // Always supply a UUID so the insert works even if the column has no DEFAULT
+      const { created_by: _cb, created_at: _ca, ...dbPayload } = game;
+      dbPayload.id = crypto.randomUUID();
       const { data: inserted, error } = await supabaseAdmin
         .from('btwin_wc_games')
         .insert(dbPayload)
