@@ -303,32 +303,78 @@ router.get('/me', authMiddleware, async (req, res) => {
 
 // ─── FORGOT PASSWORD ─────────────────────────────────────────────────────────
 
+const ALLOWED_RESET_ORIGINS = [
+  'https://win-a-lott.vercel.app',
+  'http://localhost:5173',
+  'http://localhost:4173',
+];
+
 router.post('/forgot-password', authLimiter, async (req, res) => {
-  const { email } = req.body;
+  const { email, origin } = req.body;
   if (!email) return res.status(400).json({ success: false, error: 'Email required' });
 
-  // Always return the same message to prevent email enumeration
-  if (IS_SUPABASE_CONFIGURED) {
-    try {
-      await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${CLIENT_URL}/auth/reset-password`,
-      });
-    } catch { /* non-blocking */ }
-  }
+  // Respond immediately — never reveal whether the email exists
+  res.json({ success: true, message: 'If that email exists, a reset link has been sent' });
 
-  return res.json({ success: true, message: 'If that email exists, a reset link has been sent' });
+  if (!IS_SUPABASE_CONFIGURED) return;
+
+  try {
+    const base       = ALLOWED_RESET_ORIGINS.includes(origin) ? origin : CLIENT_URL;
+    const redirectTo = `${base}/auth/reset-password`;
+
+    // generateLink gets the reset URL without Supabase sending its own email
+    const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({
+      type:        'recovery',
+      email,
+      options:     { redirectTo },
+    });
+
+    if (linkErr || !linkData?.properties?.action_link) {
+      console.warn('[forgot-password] generateLink failed:', linkErr?.message);
+      return;
+    }
+
+    const resetLink = linkData.properties.action_link;
+
+    // Look up the user's first name for a personal greeting
+    const { data: profile } = await supabaseAdmin
+      .from('btwin_users')
+      .select('full_name, username')
+      .eq('email', email)
+      .single();
+
+    const name = profile?.full_name?.split(' ')[0] || profile?.username || 'there';
+
+    // Fire-and-forget — send via Google Apps Script
+    const appsScriptUrl = process.env.APPS_SCRIPT_EMAIL_URL;
+    if (appsScriptUrl) {
+      fetch(appsScriptUrl, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ email, resetLink, name }),
+      }).catch(err => console.error('[forgot-password] Apps Script call failed:', err.message));
+    } else {
+      console.warn('[forgot-password] APPS_SCRIPT_EMAIL_URL not set — email not sent');
+    }
+  } catch (err) {
+    console.error('[forgot-password]', err.message);
+  }
 });
 
 
 // ─── RESET PASSWORD ───────────────────────────────────────────────────────────
-// Frontend reads access_token from URL hash (#access_token=...&type=recovery)
-// and sends it here along with the new password.
+// Handles two Supabase flows:
+//   Implicit: frontend reads #access_token=XXX&type=recovery from URL hash
+//   PKCE:     frontend reads ?code=XXX from URL query string
 
 router.post('/reset-password', authLimiter, async (req, res) => {
-  const { access_token, new_password } = req.body;
+  const { access_token, code, new_password } = req.body;
 
-  if (!access_token || !new_password) {
-    return res.status(400).json({ success: false, error: 'access_token and new_password required' });
+  if (!new_password) {
+    return res.status(400).json({ success: false, error: 'new_password required' });
+  }
+  if (!access_token && !code) {
+    return res.status(400).json({ success: false, error: 'access_token or code required' });
   }
   if (new_password.length < 8) {
     return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' });
@@ -339,14 +385,26 @@ router.post('/reset-password', authLimiter, async (req, res) => {
   }
 
   try {
-    // Validate the Supabase recovery token and get the user
-    const { data: { user }, error: getUserError } = await supabaseAdmin.auth.getUser(access_token);
-    if (getUserError || !user) {
-      return res.status(400).json({ success: false, error: 'Invalid or expired reset token' });
+    let userId;
+
+    if (code) {
+      // PKCE flow — exchange the one-time code for a session
+      const { data, error: codeError } = await supabase.auth.exchangeCodeForSession(code);
+      if (codeError || !data?.user) {
+        return res.status(400).json({ success: false, error: 'Invalid or expired reset code' });
+      }
+      userId = data.user.id;
+    } else {
+      // Implicit flow — validate the access token
+      const { data: { user }, error: tokenError } = await supabaseAdmin.auth.getUser(access_token);
+      if (tokenError || !user) {
+        return res.status(400).json({ success: false, error: 'Invalid or expired reset token' });
+      }
+      userId = user.id;
     }
 
-    // Update the password
-    const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(user.id, {
+    // Update the password via admin API
+    const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(userId, {
       password: new_password,
     });
     if (updateError) throw updateError;
@@ -354,7 +412,7 @@ router.post('/reset-password', authLimiter, async (req, res) => {
     return res.json({ success: true, message: 'Password reset successfully. You can now log in.' });
   } catch (err) {
     console.error('[auth/reset-password]', err.message);
-    return res.status(400).json({ success: false, error: 'Invalid or expired reset token' });
+    return res.status(400).json({ success: false, error: 'Invalid or expired reset link. Request a new one.' });
   }
 });
 
