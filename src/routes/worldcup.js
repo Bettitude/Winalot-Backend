@@ -16,6 +16,59 @@ const IS_DB = !!(
 // In-memory fallback when Supabase is not configured (dev/demo)
 const wcGames = new Map();
 
+// In-memory ticker — populated from finished mock fixtures and from settle calls
+const mockTicker = [];
+
+const TICKER_NAMES   = ['mike23','james99','sarah','emma05','chris','tom','olivia','jack11',
+                        'amy','liam','sophie','harry','ben','zoe','ryan07','charlotte',
+                        'nathan','mia','dylan','grace','ethan','chloe','luke','anna',
+                        'josh','jessica','adam','hannah','daniel','katie'];
+const TICKER_PRIZES  = [5, 10, 10, 10, 15, 15, 20, 25];
+
+function pickRandom(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function buildMockTicker() {
+  if (mockTicker.length > 0) return; // already seeded
+  const finished = MOCK_WC_FIXTURES.filter(f => ['FT','AET','PEN'].includes(f.fixture.status.short));
+  for (const f of finished) {
+    const count = Math.floor(Math.random() * 4) + 3; // 3–6 per finished game
+    for (let i = 0; i < count; i++) {
+      mockTicker.push({
+        id:         `mt-${f.fixture.id}-${i}`,
+        home_team:  f.teams.home.name,
+        away_team:  f.teams.away.name,
+        question:   '',
+        username:   pickRandom(TICKER_NAMES),
+        prize_type: 'cash',
+        prize_usd:  pickRandom(TICKER_PRIZES),
+        prize_description: null,
+        is_dummy:   true,
+        created_at: new Date(Date.now() - (finished.indexOf(f) * 3600000 + i * 300000)).toISOString(),
+      });
+    }
+  }
+  // Sort newest first
+  mockTicker.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+}
+
+function addMockDummies(game) {
+  const count = Math.floor(Math.random() * 4) + 3;
+  for (let i = 0; i < count; i++) {
+    mockTicker.unshift({
+      id:                `mt-settle-${game.fixture_id}-${i}`,
+      home_team:         game.home_team  || '',
+      away_team:         game.away_team  || '',
+      question:          game.question   || '',
+      username:          pickRandom(TICKER_NAMES),
+      prize_type:        game.prize_type || 'cash',
+      prize_usd:         game.prize_type === 'cash' ? pickRandom(TICKER_PRIZES) : null,
+      prize_description: game.prize_description || null,
+      is_dummy:          true,
+      created_at:        new Date().toISOString(),
+    });
+  }
+}
+
 // ── Mock WC 2026 fixtures ─────────────────────────────────────────────────────
 const F = cc => `https://flagcdn.com/w80/${cc}.png`;
 const MOCK_WC_FIXTURES = [
@@ -107,7 +160,24 @@ async function attachGames(fixtures) {
     gamesMap = wcGames;
   }
   return fixtures.map(f => {
-    const game = gamesMap.get(String(f.fixture.id));
+    // Primary: match by fixture ID
+    let game = gamesMap.get(String(f.fixture.id));
+
+    // Fallback: match by home + away team name (handles mock→real ID switch)
+    if (!game && f.teams) {
+      const home = f.teams.home?.name?.toLowerCase().trim();
+      const away = f.teams.away?.name?.toLowerCase().trim();
+      for (const g of gamesMap.values()) {
+        if (
+          g.home_team?.toLowerCase().trim() === home &&
+          g.away_team?.toLowerCase().trim() === away
+        ) {
+          game = g;
+          break;
+        }
+      }
+    }
+
     return { ...f, freeGame: game ? sanitizeGame(game) : null };
   });
 }
@@ -515,6 +585,13 @@ router.post('/games/:fixtureId/settle', adminMiddleware, async (req, res) => {
       wcGames.set(key, game);
     }
 
+    // Auto-seed winner ticker with dummy entries for social proof
+    if (IS_DB) {
+      supabaseAdmin.rpc('btwin_wc_insert_dummies', { p_game_id: game.id }).catch(() => {});
+    } else {
+      addMockDummies(game);
+    }
+
     // Non-blocking: email merch winners asking for address
     for (const w of winners) {
       if (game.prize_type === 'merch') {
@@ -540,6 +617,98 @@ router.post('/games/:fixtureId/settle', adminMiddleware, async (req, res) => {
     });
   } catch (err) {
     console.error('[worldcup/settle]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/worldcup/games/:fixtureId/winners ───────────────────────────────
+// Returns real winners (not dummies) for a settled game — used by admin history view.
+router.get('/games/:fixtureId/winners', adminMiddleware, async (req, res) => {
+  const key = req.params.fixtureId;
+  try {
+    if (IS_DB) {
+      const { data: g } = await supabaseAdmin
+        .from('btwin_wc_games').select('id').eq('fixture_id', key).maybeSingle();
+      if (!g) return res.json({ success: true, data: [] });
+
+      const { data, error } = await supabaseAdmin
+        .from('btwin_wc_winners')
+        .select('username, email, prize_type, prize_usd, prize_description, created_at')
+        .eq('game_id', g.id)
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+      return res.json({ success: true, data: data || [] });
+    }
+
+    // Mock mode — return winners stored on the in-memory game
+    const game = wcGames.get(key);
+    return res.json({ success: true, data: game?.winners || [] });
+  } catch (err) {
+    console.error('[worldcup/winners]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/worldcup/ticker ──────────────────────────────────────────────────
+// Returns recent WC winner events (real + dummy) for the scrolling ticker.
+router.get('/ticker', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 40, 100);
+  try {
+    if (IS_DB) {
+      const { data, error } = await supabaseAdmin
+        .from('btwin_wc_ticker')
+        .select('id, home_team, away_team, question, username, prize_type, prize_usd, prize_description, is_dummy, created_at')
+        .or('prize_usd.is.null,prize_usd.lte.50')  // cap: WC prizes never exceed $50
+        .not('game_id', 'is', null)                 // must belong to a real WC game
+        .order('created_at', { ascending: false })
+        .limit(limit);
+      // If DB has entries, use them; otherwise fall through to mock below
+      if (!error && data && data.length >= 4) {
+        return res.json({ success: true, data });
+      }
+    }
+
+    // Mock mode (no DB, or DB table is still empty) — seed from finished fixtures
+    buildMockTicker();
+    return res.json({ success: true, data: mockTicker.slice(0, limit) });
+  } catch (err) {
+    console.error('[worldcup/ticker]', err.message);
+    buildMockTicker();
+    return res.json({ success: true, data: mockTicker.slice(0, limit) });
+  }
+});
+
+// ── GET /api/worldcup/leaderboard ─────────────────────────────────────────────
+// Returns per-username win/prize totals for the WC leaderboard section.
+router.get('/leaderboard', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+  try {
+    if (IS_DB) {
+      const { data, error } = await supabaseAdmin
+        .from('btwin_wc_leaderboard')
+        .select('username, wins, total_usd')
+        .limit(limit);
+      // Use DB data only if it has real entries
+      if (!error && data && data.length >= 3) {
+        return res.json({ success: true, data });
+      }
+    }
+
+    // Mock mode (no DB, or DB is still empty) — derive from in-memory ticker
+    buildMockTicker();
+    const grouped = {};
+    for (const t of mockTicker) {
+      if (!t.prize_usd) continue;
+      if (!grouped[t.username]) grouped[t.username] = { username: t.username, wins: 0, total_usd: 0 };
+      grouped[t.username].wins      += 1;
+      grouped[t.username].total_usd += Number(t.prize_usd);
+    }
+    const data = Object.values(grouped)
+      .sort((a, b) => b.total_usd - a.total_usd)
+      .slice(0, limit);
+    return res.json({ success: true, data });
+  } catch (err) {
+    console.error('[worldcup/leaderboard]', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 });

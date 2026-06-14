@@ -305,8 +305,11 @@ router.get('/me', authMiddleware, async (req, res) => {
 
 const ALLOWED_RESET_ORIGINS = [
   'https://win-a-lott.vercel.app',
-  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:3001',
   'http://localhost:4173',
+  'http://localhost:5173',
+  'http://localhost:5174',
 ];
 
 router.post('/forgot-password', authLimiter, async (req, res) => {
@@ -319,8 +322,7 @@ router.post('/forgot-password', authLimiter, async (req, res) => {
   if (!IS_SUPABASE_CONFIGURED) return;
 
   try {
-    const base       = ALLOWED_RESET_ORIGINS.includes(origin) ? origin : CLIENT_URL;
-    const redirectTo = `${base}/auth/reset-password`;
+    const redirectTo = `${CLIENT_URL}/auth/reset-password`;
 
     // generateLink gets the reset URL without Supabase sending its own email
     const { data: linkData, error: linkErr } = await supabaseAdmin.auth.admin.generateLink({

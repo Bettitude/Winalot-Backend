@@ -28,20 +28,27 @@ router.get('/winners', async (req, res) => {
   const tier  = req.query.tier || null;
 
   if (IS_MOCK || !IS_DB_CONFIGURED) {
-    const tiers    = ['silver', 'gold', 'platinum', 'free'];
-    const names    = ['lucky_striker', 'goal_getter', 'soccer_pro', 'match_winner', 'fan_zone', 'top_scorer', 'net_buster'];
-    const matches  = ['Arsenal vs Chelsea', 'Man City vs Liverpool', 'Real Madrid vs Barcelona', 'PSG vs Bayern'];
-    const markets  = ['Will home team score first?', 'Both teams to score?', 'Match winner — Home?'];
-    const mock = Array.from({ length: limit }, (_, i) => ({
-      id:           `winner-mock-${i}`,
-      ticketNumber: `WAL-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-${String(i+1).padStart(5,'0')}`,
-      username:     names[i % names.length],
-      match:        matches[i % matches.length],
-      market:       markets[i % markets.length],
-      prize:        parseFloat((Math.random() * 500 + 50).toFixed(2)),
-      tier:         tiers[i % tiers.length],
-      createdAt:    new Date(Date.now() - i * 7200000).toISOString(),
-    })).filter(w => !tier || w.tier === tier);
+    const tiers   = ['silver', 'gold', 'platinum', 'free'];
+    const names   = ['mike23', 'james99', 'sarah', 'emma05', 'chris',
+                     'tom', 'olivia', 'jack11', 'amy', 'liam',
+                     'sophie', 'harry', 'ben', 'zoe', 'ryan07'];
+    const matches = ['Arsenal vs Chelsea', 'Man City vs Liverpool', 'Real Madrid vs Barcelona', 'PSG vs Bayern'];
+    const markets = ['Will home team score first?', 'Both teams to score?', 'Match winner — Home?'];
+    const tierPrize = { silver: [5,8,10,12,15], gold: [20,25,30,40,50], platinum: [100,150,200], free: [5,10,15,20] };
+    const mock = Array.from({ length: limit }, (_, i) => {
+      const t = tiers[i % tiers.length];
+      const pool = tierPrize[t];
+      return {
+        id:           `winner-mock-${i}`,
+        ticketNumber: `WAL-${new Date().toISOString().slice(0,10).replace(/-/g,'')}-${String(i+1).padStart(5,'0')}`,
+        username:     names[i % names.length],
+        match:        matches[i % matches.length],
+        market:       markets[i % markets.length],
+        prize:        pool[Math.floor(Math.random() * pool.length)],
+        tier:         t,
+        createdAt:    new Date(Date.now() - i * 7200000).toISOString(),
+      };
+    }).filter(w => !tier || w.tier === tier);
     return res.json({ success: true, data: { winners: mock } });
   }
 
