@@ -199,6 +199,36 @@ router.post('/', adminMiddleware, async (req, res) => {
   const resolvedTitle  = title || `${team_home} vs ${team_away}`;
   const resolvedStatus = ['draft', 'active'].includes(reqStatus) ? reqStatus : 'draft';
 
+  // ── Supabase path ──────────────────────────────────────────────────────────
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data: match, error } = await supabaseAdmin
+        .from('btwin_matches')
+        .insert({
+          title:           resolvedTitle,
+          team_home,
+          team_away,
+          league:          league || null,
+          stadium:         stadium || null,
+          match_date:      match_date || null,
+          ticket_sales_close: match_date || null,
+          status:          resolvedStatus,
+          api_football_id: api_fixture_id ? Number(api_fixture_id) : null,
+          home_logo:       home_logo || null,
+          away_logo:       away_logo || null,
+          author_id:       req.user.id,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+      auditLog(req.user.id, 'CREATE_MATCH', match.id);
+      return res.status(201).json({ success: true, data: { match }, message: 'Match created' });
+    } catch (err) {
+      console.error('[matches/post/supabase]', err.message);
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   if (!IS_DB_CONFIGURED) {
     return res.status(201).json({
       success: true,
@@ -238,6 +268,28 @@ router.put('/:id', adminMiddleware, async (req, res) => {
   const updates = {};
   allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
 
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      if (!Object.keys(updates).length) return res.status(400).json({ success: false, error: 'Nothing to update' });
+      // Remap api_fixture_id → api_football_id for Supabase
+      if (updates.api_fixture_id !== undefined) {
+        updates.api_football_id = updates.api_fixture_id ? Number(updates.api_fixture_id) : null;
+        delete updates.api_fixture_id;
+      }
+      const { data: match, error } = await supabaseAdmin
+        .from('btwin_matches')
+        .update(updates)
+        .eq('id', req.params.id)
+        .select()
+        .single();
+      if (error) throw error;
+      auditLog(req.user.id, 'UPDATE_MATCH', req.params.id);
+      return res.json({ success: true, data: { match } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { match: { id: req.params.id, ...updates } } });
 
   try {
@@ -254,6 +306,17 @@ router.put('/:id', adminMiddleware, async (req, res) => {
 
 // DELETE /api/matches/:id  (admin)
 router.delete('/:id', adminMiddleware, async (req, res) => {
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { error } = await supabaseAdmin.from('btwin_matches').delete().eq('id', req.params.id);
+      if (error) throw error;
+      auditLog(req.user.id, 'DELETE_MATCH', req.params.id);
+      return res.json({ success: true, message: 'Match deleted' });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   if (!IS_DB_CONFIGURED) return res.json({ success: true, message: 'Match deleted (mock)' });
 
   try {

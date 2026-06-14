@@ -116,24 +116,84 @@ async function attachGames(fixtures) {
 router.get('/fixtures', async (req, res) => {
   const { date } = req.query;
   let fixtures;
+  let source = 'mock';
+  let apiError = null;
 
   if (!process.env.APIFOOTBALL_KEY) {
     fixtures = date ? MOCK_WC_FIXTURES.filter(f => f.fixture.date.startsWith(date)) : MOCK_WC_FIXTURES;
+    source = 'mock_no_key';
   } else {
     try {
       const result = date ? await apiFootball.getWorldCupByDate(date) : await apiFootball.getWorldCupFixtures();
-      fixtures = result?.response || [];
-    } catch {
-      fixtures = MOCK_WC_FIXTURES;
+      const rows = result?.response || [];
+
+      if (rows.length > 0) {
+        fixtures = rows;
+        source = 'api';
+      } else {
+        // API returned 0 results — might be wrong season/league or plan limitation
+        apiError = result?.errors?.length
+          ? JSON.stringify(result.errors)
+          : `API returned 0 fixtures (results: ${result?.results ?? 'unknown'}, errors: ${JSON.stringify(result?.errors ?? [])})`;
+        console.warn('[worldcup/fixtures] API-Football returned empty:', apiError);
+        fixtures = date ? MOCK_WC_FIXTURES.filter(f => f.fixture.date.startsWith(date)) : MOCK_WC_FIXTURES;
+        source = 'mock_empty_api';
+      }
+    } catch (err) {
+      apiError = err.message;
+      console.error('[worldcup/fixtures] API-Football error:', err.message);
+      fixtures = date ? MOCK_WC_FIXTURES.filter(f => f.fixture.date.startsWith(date)) : MOCK_WC_FIXTURES;
+      source = 'mock_api_error';
     }
   }
 
   try {
     const data = await attachGames(fixtures);
-    return res.json({ success: true, data, source: process.env.APIFOOTBALL_KEY ? 'api' : 'mock' });
+    return res.json({ success: true, data, source, apiError });
   } catch (err) {
     console.error('[worldcup/fixtures] attachGames error:', err.message);
-    return res.json({ success: true, data: fixtures.map(f => ({ ...f, freeGame: null })), source: 'mock_fallback' });
+    return res.json({ success: true, data: fixtures.map(f => ({ ...f, freeGame: null })), source: 'mock_fallback', apiError: err.message });
+  }
+});
+
+// ── GET /api/worldcup/sync — admin: force-fetch fresh fixtures from API-Football ──
+router.get('/sync', adminMiddleware, async (req, res) => {
+  if (!process.env.APIFOOTBALL_KEY) {
+    return res.status(400).json({ success: false, error: 'APIFOOTBALL_KEY is not configured in .env' });
+  }
+  try {
+    // Use a direct HTTPS request, bypass Redis cache
+    const https = require('https');
+    const fetchDirect = (path) => new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'v3.football.api-sports.io',
+        path,
+        method: 'GET',
+        headers: { 'x-apisports-key': process.env.APIFOOTBALL_KEY },
+        timeout: 15000,
+      };
+      const req2 = https.request(options, (r) => {
+        let data = '';
+        r.on('data', c => { data += c; });
+        r.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+      });
+      req2.on('error', reject);
+      req2.on('timeout', () => { req2.destroy(); reject(new Error('API-Football request timed out')); });
+      req2.end();
+    });
+
+    const result = await fetchDirect('/fixtures?league=1&season=2026');
+    return res.json({
+      success: true,
+      results: result?.results ?? 0,
+      errors: result?.errors ?? [],
+      sample: (result?.response || []).slice(0, 2),
+      message: result?.results > 0
+        ? `API-Football returned ${result.results} WC 2026 fixtures. Data is live.`
+        : 'API-Football returned 0 fixtures — check your plan or the league/season ID.',
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
   }
 });
 
