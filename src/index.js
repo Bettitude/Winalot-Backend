@@ -36,8 +36,11 @@ const isProd = process.env.NODE_ENV === 'production';
 const allowedOrigins = [
   process.env.CLIENT_URL || 'http://localhost:5173',
   process.env.ADMIN_URL  || 'http://localhost:5174',
-  'https://win-a-lott.vercel.app',        // production frontend
-  'https://win-a-lott-admin.vercel.app',  // production admin (update if different)
+  'https://www.bwinalott.com',
+  'https://bwinalott.com',
+  'https://admin.bwinalott.com',
+  'https://win-a-lott.vercel.app',
+  'https://win-a-lott-admin.vercel.app',
   ...(process.env.EXTRA_ORIGINS ? process.env.EXTRA_ORIGINS.split(',').map(o => o.trim()) : []),
 ].filter(Boolean);
 

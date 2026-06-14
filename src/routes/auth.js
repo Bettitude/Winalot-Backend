@@ -304,6 +304,9 @@ router.get('/me', authMiddleware, async (req, res) => {
 // ─── FORGOT PASSWORD ─────────────────────────────────────────────────────────
 
 const ALLOWED_RESET_ORIGINS = [
+  'https://www.bwinalott.com',
+  'https://bwinalott.com',
+  'https://admin.bwinalott.com',
   'https://win-a-lott.vercel.app',
   'http://localhost:3000',
   'http://localhost:3001',

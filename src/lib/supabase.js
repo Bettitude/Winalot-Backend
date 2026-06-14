@@ -1,16 +1,18 @@
 const { createClient } = require('@supabase/supabase-js');
 
-// Public client — uses anon key, subject to RLS
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
-);
+const SUPABASE_URL  = process.env.SUPABASE_URL  || '';
+const ANON_KEY      = process.env.SUPABASE_ANON_KEY || '';
+const SERVICE_KEY   = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 
-// Admin client — uses service role key, bypasses RLS
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { autoRefreshToken: false, persistSession: false } }
-);
+// Only create real clients when credentials are present
+const supabase = SUPABASE_URL && ANON_KEY
+  ? createClient(SUPABASE_URL, ANON_KEY)
+  : null;
+
+const supabaseAdmin = SUPABASE_URL && SERVICE_KEY
+  ? createClient(SUPABASE_URL, SERVICE_KEY, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
+  : null;
 
 module.exports = { supabase, supabaseAdmin };
