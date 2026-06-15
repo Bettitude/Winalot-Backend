@@ -128,13 +128,21 @@ app.use((err, _req, res, _next) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = parseInt(process.env.PORT || '3001', 10);
-server.listen(PORT, () => {
-  console.log(`[server] bWinALOTT backend running on port ${PORT} (${process.env.NODE_ENV || 'development'})`);
-  // Run connection checks after the server is up (non-blocking)
+// On Vercel (serverless) there is no persistent process — skip listen + Socket.io.
+// On Render / local dev, start normally.
+const IS_SERVERLESS = !!process.env.VERCEL;
+
+if (!IS_SERVERLESS) {
+  const PORT = parseInt(process.env.PORT || '3001', 10);
+  server.listen(PORT, () => {
+    console.log(`[server] bWinALOTT backend running on port ${PORT} (${process.env.NODE_ENV || 'development'})`);
+    runAndStore().catch(err => console.error('[startup] check failed:', err.message));
+  });
+  initSocket(server);
+} else {
+  // Vercel: run startup checks once on cold start (non-blocking)
   runAndStore().catch(err => console.error('[startup] check failed:', err.message));
-});
+}
 
-initSocket(server);
-
-module.exports = { app, server };
+// Vercel needs the Express app exported directly (not wrapped in { app, server })
+module.exports = app;
