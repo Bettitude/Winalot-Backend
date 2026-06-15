@@ -32,8 +32,13 @@ router.get('/winners', async (req, res) => {
     const names   = ['mike23', 'james99', 'sarah', 'emma05', 'chris',
                      'tom', 'olivia', 'jack11', 'amy', 'liam',
                      'sophie', 'harry', 'ben', 'zoe', 'ryan07'];
-    const matches = ['Arsenal vs Chelsea', 'Man City vs Liverpool', 'Real Madrid vs Barcelona', 'PSG vs Bayern'];
-    const markets = ['Will home team score first?', 'Both teams to score?', 'Match winner — Home?'];
+    const matches = [
+      'Mexico vs Poland', 'USA vs Jamaica', 'Brazil vs Venezuela',
+      'Argentina vs Peru', 'England vs Serbia', 'France vs Morocco',
+      'Spain vs Croatia', 'Germany vs Scotland', 'Portugal vs Czechia',
+      'Netherlands vs Senegal', 'Canada vs Colombia', 'Belgium vs Egypt',
+    ];
+    const markets = ['Who will win this match?', 'Both teams to score?', 'Match winner?'];
     const tierPrize = { silver: [5,8,10,12,15], gold: [20,25,30,40,50], platinum: [100,150,200], free: [5,10,15,20] };
     const mock = Array.from({ length: limit }, (_, i) => {
       const t = tiers[i % tiers.length];
