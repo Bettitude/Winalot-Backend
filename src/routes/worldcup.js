@@ -713,6 +713,152 @@ router.get('/leaderboard', async (req, res) => {
   }
 });
 
+// ── GET /api/worldcup/games/:fixtureId/my-entry — check if authed user already entered ──
+router.get('/games/:fixtureId/my-entry', authMiddleware, async (req, res) => {
+  const key = req.params.fixtureId;
+  try {
+    if (IS_DB) {
+      const { data: g } = await supabaseAdmin
+        .from('btwin_wc_games').select('id').eq('fixture_id', key).maybeSingle();
+      if (!g) return res.json({ success: true, data: null });
+
+      const { data } = await supabaseAdmin
+        .from('btwin_wc_entries')
+        .select('option_key, entered_at')
+        .eq('game_id', g.id)
+        .eq('user_id', req.user.id)
+        .maybeSingle();
+      return res.json({ success: true, data: data || null });
+    }
+
+    const game = wcGames.get(key);
+    const entry = game?.entries?.find(e => e.user_id === req.user.id) || null;
+    return res.json({ success: true, data: entry ? { option_key: entry.option_key, entered_at: entry.entered_at } : null });
+  } catch (err) {
+    console.error('[worldcup/my-entry]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/worldcup/my-entries — all entries for current user ────────────────
+router.get('/my-entries', authMiddleware, async (req, res) => {
+  try {
+    if (IS_DB) {
+      const { data, error } = await supabaseAdmin
+        .from('btwin_wc_entries')
+        .select(`
+          option_key, entered_at,
+          btwin_wc_games (
+            fixture_id, home_team, away_team, question, status,
+            prize_type, prize_usd, prize_description, winner_count,
+            correct_option, options
+          )
+        `)
+        .eq('user_id', req.user.id)
+        .order('entered_at', { ascending: false });
+      if (error) throw error;
+      return res.json({ success: true, data: (data || []).map(e => ({
+        option_key:  e.option_key,
+        entered_at:  e.entered_at,
+        fixture_id:  e.btwin_wc_games?.fixture_id,
+        home_team:   e.btwin_wc_games?.home_team,
+        away_team:   e.btwin_wc_games?.away_team,
+        question:    e.btwin_wc_games?.question,
+        status:      e.btwin_wc_games?.status,
+        prize_type:  e.btwin_wc_games?.prize_type,
+        prize_usd:   e.btwin_wc_games?.prize_usd,
+        prize_description: e.btwin_wc_games?.prize_description,
+        winner_count: e.btwin_wc_games?.winner_count,
+        correct_option: e.btwin_wc_games?.correct_option,
+        options:     e.btwin_wc_games?.options,
+      })) });
+    }
+
+    // Mock mode — gather from in-memory store
+    const entries = [];
+    for (const [fixtureId, game] of wcGames.entries()) {
+      const e = game.entries?.find(en => en.user_id === req.user.id);
+      if (e) entries.push({
+        option_key: e.option_key, entered_at: e.entered_at,
+        fixture_id: fixtureId, home_team: game.home_team, away_team: game.away_team,
+        question: game.question, status: game.status,
+        prize_type: game.prize_type, prize_usd: game.prize_usd,
+        prize_description: game.prize_description, winner_count: game.winner_count,
+        correct_option: game.correct_option, options: game.options,
+      });
+    }
+    entries.sort((a, b) => new Date(b.entered_at) - new Date(a.entered_at));
+    return res.json({ success: true, data: entries });
+  } catch (err) {
+    console.error('[worldcup/my-entries]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/worldcup/games/:fixtureId/pool — public pool stats ───────────────
+router.get('/games/:fixtureId/pool', async (req, res) => {
+  const key = req.params.fixtureId;
+  try {
+    let game, entries = [];
+
+    if (IS_DB) {
+      const { data: g } = await supabaseAdmin
+        .from('btwin_wc_games')
+        .select('id, home_team, away_team, question, status, prize_type, prize_usd, prize_description, winner_count, options, correct_option, entry_count')
+        .eq('fixture_id', key).maybeSingle();
+      if (!g) return res.status(404).json({ success: false, error: 'Game not found' });
+      game = g;
+
+      const { data: rawEntries } = await supabaseAdmin
+        .from('btwin_wc_entries')
+        .select('option_key, username, entered_at')
+        .eq('game_id', g.id)
+        .order('entered_at', { ascending: false })
+        .limit(200);
+      entries = rawEntries || [];
+    } else {
+      game = wcGames.get(key);
+      if (!game) return res.status(404).json({ success: false, error: 'Game not found' });
+      entries = game.entries || [];
+    }
+
+    // Build option breakdown counts
+    const breakdown = {};
+    for (const opt of (game.options || [])) breakdown[opt.key] = { key: opt.key, label: opt.label, count: 0 };
+    for (const e of entries) {
+      if (breakdown[e.option_key]) breakdown[e.option_key].count++;
+    }
+
+    // Recent entrants — show username with last 3 chars masked
+    const recent = entries.slice(0, 20).map(e => ({
+      username: e.username ? e.username.slice(0, -2).replace(/.(?=.{0,2}$)/g, '*').padStart(e.username.length, e.username[0]) : 'user***',
+      option_key: e.option_key,
+      entered_at: e.entered_at,
+    }));
+
+    return res.json({
+      success: true,
+      data: {
+        fixture_id:   key,
+        home_team:    game.home_team,
+        away_team:    game.away_team,
+        question:     game.question,
+        status:       game.status,
+        prize_type:   game.prize_type,
+        prize_usd:    game.prize_usd,
+        prize_description: game.prize_description,
+        winner_count: game.winner_count,
+        total_entries: entries.length || game.entry_count || 0,
+        breakdown:    Object.values(breakdown),
+        recent,
+      },
+    });
+  } catch (err) {
+    console.error('[worldcup/pool]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── DELETE /api/worldcup/games/:fixtureId ─────────────────────────────────────
 router.delete('/games/:fixtureId', adminMiddleware, async (req, res) => {
   const key = req.params.fixtureId;
