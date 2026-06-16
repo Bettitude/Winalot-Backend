@@ -110,12 +110,12 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/live',          liveRoutes);
 app.use('/api/football',      footballRoutes);
 app.use('/api/giveaways',     giveawayRoutes);
-app.use('/api/worldcup',     worldcupRoutes);
-app.use('/api/analytics',    analyticsRoutes);
-app.use('/api/admin/stats',  adminStatsRoutes);
-app.use('/api/referrals',   referralRoutes);
-app.use('/api/btp-settings', btpSettingsRoutes);
-app.use('/api/ads',         adsRoutes);
+app.use('/api/worldcup',      worldcupRoutes);
+app.use('/api/analytics',     analyticsRoutes);
+app.use('/api/admin/stats',   adminStatsRoutes);
+app.use('/api/referrals',     referralRoutes);
+app.use('/api/btp-settings',  btpSettingsRoutes);
+app.use('/api/ads',           adsRoutes);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ success: false, error: 'Route not found' }));
