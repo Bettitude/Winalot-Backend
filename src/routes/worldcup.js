@@ -6,6 +6,7 @@ const { adminMiddleware } = require('../middleware/admin');
 const { authMiddleware }  = require('../middleware/auth');
 const { emailService }    = require('../services/email');
 const { supabaseAdmin }   = require('../lib/supabase');
+const { createChangeRequest } = require('../services/changeRequests');
 
 const IS_DB = !!(
   process.env.SUPABASE_URL &&
@@ -105,7 +106,7 @@ async function dbEnrichWithCounts(games) {
 async function dbGetGamesMap() {
   const { data, error } = await supabaseAdmin
     .from('btwin_wc_games')
-    .select('id, fixture_id, question, options, correct_option, prize_type, prize_usd, prize_cents, prize_description, winner_count, status');
+    .select('id, fixture_id, question, options, correct_option, prize_type, prize_usd, prize_cents, prize_description, winner_count, status, min_entries, max_entries');
   if (error) throw error;
   const enriched = await dbEnrichWithCounts(data || []);
   const map = new Map();
@@ -304,13 +305,97 @@ router.get('/games', authMiddleware, async (_req, res) => {
   }
 });
 
+// ── GET /api/worldcup/my-entries — pools the current user has entered ─────────
+router.get('/my-entries', authMiddleware, async (req, res) => {
+  if (!IS_DB) return res.json({ success: true, data: { entries: [] } });
+
+  try {
+    const { data: myEntries, error } = await supabaseAdmin
+      .from('btwin_wc_entries')
+      .select('id, game_id, fixture_id, option_key, entered_at')
+      .eq('user_id', req.user.id)
+      .order('entered_at', { ascending: false });
+    if (error) throw error;
+    if (!myEntries?.length) return res.json({ success: true, data: { entries: [] } });
+
+    const gameIds = [...new Set(myEntries.map(e => e.game_id))];
+    const { data: games } = await supabaseAdmin
+      .from('btwin_wc_games')
+      .select('id, fixture_id, home_team, away_team, match_date, question, options, correct_option, prize_type, prize_usd, prize_description, winner_count, status')
+      .in('id', gameIds);
+    const gameMap = Object.fromEntries((games || []).map(g => [g.id, g]));
+
+    const { data: allEntries } = await supabaseAdmin
+      .from('btwin_wc_entries')
+      .select('game_id')
+      .in('game_id', gameIds);
+    const countMap = {};
+    for (const e of (allEntries || [])) countMap[e.game_id] = (countMap[e.game_id] || 0) + 1;
+
+    const entries = myEntries.map(e => {
+      const g = gameMap[e.game_id] || {};
+      const options = Array.isArray(g.options) ? g.options : [];
+      return {
+        id:                e.id,
+        type:              'free',
+        game_id:           e.game_id,
+        fixture_id:        e.fixture_id,
+        home_team:         g.home_team,
+        away_team:         g.away_team,
+        match_date:        g.match_date,
+        question:          g.question,
+        option_key:        e.option_key,
+        my_pick:           options.find(o => o.key === e.option_key)?.label || e.option_key,
+        correct_option:    g.correct_option,
+        status:            g.status,
+        prize_type:        g.prize_type,
+        prize_usd:         g.prize_usd,
+        prize_description: g.prize_description,
+        winner_count:      g.winner_count,
+        entry_count:       countMap[e.game_id] || 0,
+        entered_at:        e.entered_at,
+      };
+    });
+
+    return res.json({ success: true, data: { entries } });
+  } catch (err) {
+    console.error('[worldcup/my-entries]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/worldcup/games/:fixtureId/activity — live "who's entering" feed ──
+router.get('/games/:fixtureId/activity', async (req, res) => {
+  if (!IS_DB) return res.json({ success: true, data: { entry_count: 0, recent: [] } });
+
+  try {
+    const { data: game } = await supabaseAdmin
+      .from('btwin_wc_games')
+      .select('id')
+      .eq('fixture_id', req.params.fixtureId)
+      .maybeSingle();
+    if (!game) return res.json({ success: true, data: { entry_count: 0, recent: [] } });
+
+    const { data: recent, count } = await supabaseAdmin
+      .from('btwin_wc_entries')
+      .select('username, option_key, entered_at', { count: 'exact' })
+      .eq('game_id', game.id)
+      .order('entered_at', { ascending: false })
+      .limit(15);
+
+    return res.json({ success: true, data: { entry_count: count || 0, recent: recent || [] } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── POST /api/worldcup/games — admin creates a free prediction game ───────────
 router.post('/games', adminMiddleware, async (req, res) => {
   const {
     fixture_id, home_team, away_team, match_date,
     question, options,
     prize_type = 'cash', prize_usd, prize_description,
-    winner_count,
+    winner_count, min_entries, max_entries,
   } = req.body;
 
   if (!fixture_id)         return res.status(400).json({ success: false, error: 'fixture_id is required' });
@@ -319,6 +404,23 @@ router.post('/games', adminMiddleware, async (req, res) => {
   if (!winner_count)       return res.status(400).json({ success: false, error: 'winner_count is required' });
   if (prize_type === 'cash'  && !prize_usd)         return res.status(400).json({ success: false, error: 'prize_usd required for cash prizes' });
   if (prize_type === 'merch' && !prize_description) return res.status(400).json({ success: false, error: 'prize_description required for merch prizes' });
+  // Regular admins can still create a game after kickoff, but it goes to a super
+  // admin for approval first rather than going live immediately.
+  const matchStarted = match_date && new Date(match_date.replace(' ', '+')) <= new Date();
+  if (!req.user?.is_super_admin && matchStarted) {
+    try {
+      const cr = await createChangeRequest({
+        type:         'late_game_creation',
+        target_id:    fixture_id,
+        payload:      req.body,
+        summary:      `Create free game for ${home_team || 'Home'} vs ${away_team || 'Away'} (match already started)`,
+        requested_by: req.user?.id,
+      });
+      return res.status(202).json({ success: true, pending: true, data: cr, message: 'Match has already started — submitted for super admin approval' });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
 
   const key  = String(fixture_id);
   const game = {
@@ -335,6 +437,8 @@ router.post('/games', adminMiddleware, async (req, res) => {
     prize_cents:       prize_usd         ? Math.round(Number(prize_usd) * 100) : null,
     prize_description: prize_description || null,
     winner_count:      Number(winner_count),
+    min_entries:       min_entries != null && min_entries !== '' ? parseInt(min_entries) : null,
+    max_entries:       max_entries != null && max_entries !== '' ? parseInt(max_entries) : null,
     status:            'open',
     created_at:        new Date().toISOString(),
     created_by:        req.user?.id || 'admin',
@@ -415,6 +519,10 @@ router.patch('/games/:fixtureId', adminMiddleware, async (req, res) => {
   }
 });
 
+// Predictions lock 30s after kickoff, even if admin hasn't manually closed the game —
+// stops people predicting once they can see early match events.
+const PREDICTION_WINDOW_MS = 30 * 1000;
+
 // ── POST /api/worldcup/games/:fixtureId/predict — user submits prediction ────
 router.post('/games/:fixtureId/predict', authMiddleware, async (req, res) => {
   const key        = req.params.fixtureId;
@@ -427,7 +535,7 @@ router.post('/games/:fixtureId/predict', authMiddleware, async (req, res) => {
     if (IS_DB) {
       const { data } = await supabaseAdmin
         .from('btwin_wc_games')
-        .select('id, status, options')
+        .select('id, status, options, match_date, max_entries')
         .eq('fixture_id', key)
         .maybeSingle();
       game = data;
@@ -437,6 +545,23 @@ router.post('/games/:fixtureId/predict', authMiddleware, async (req, res) => {
 
     if (!game)                   return res.status(404).json({ success: false, error: 'Free game not found' });
     if (game.status !== 'open') return res.status(400).json({ success: false, error: 'Predictions are closed for this game' });
+
+    if (IS_DB && game.max_entries != null) {
+      const { count: entryCount } = await supabaseAdmin
+        .from('btwin_wc_entries')
+        .select('id', { count: 'exact', head: true })
+        .eq('game_id', game.id);
+      if ((entryCount || 0) >= game.max_entries) {
+        return res.status(400).json({ success: false, error: 'This free game is full' });
+      }
+    }
+
+    if (game.match_date) {
+      const cutoff = new Date(game.match_date).getTime() + PREDICTION_WINDOW_MS;
+      if (Date.now() > cutoff) {
+        return res.status(400).json({ success: false, error: 'Predictions are closed — the match has started' });
+      }
+    }
 
     const validOption = Array.isArray(game.options) && game.options.find(o => o.key === option_key);
     if (!validOption) return res.status(400).json({ success: false, error: 'Invalid option' });
@@ -645,6 +770,61 @@ router.get('/games/:fixtureId/winners', adminMiddleware, async (req, res) => {
     return res.json({ success: true, data: game?.winners || [] });
   } catch (err) {
     console.error('[worldcup/winners]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/worldcup/games/:fixtureId/entries ────────────────────────────────
+// Returns every prediction submitted for a game — admin view, supports filtering
+// by option_key and free-text search over username/email.
+router.get('/games/:fixtureId/entries', adminMiddleware, async (req, res) => {
+  const key            = req.params.fixtureId;
+  const { option_key, search } = req.query;
+
+  try {
+    if (IS_DB) {
+      const { data: g } = await supabaseAdmin
+        .from('btwin_wc_games').select('id, options, correct_option').eq('fixture_id', key).maybeSingle();
+      if (!g) return res.json({ success: true, data: [], options: [] });
+
+      let q = supabaseAdmin
+        .from('btwin_wc_entries')
+        .select('id, user_id, username, email, option_key, created_at')
+        .eq('game_id', g.id)
+        .order('created_at', { ascending: false });
+
+      if (option_key) q = q.eq('option_key', option_key);
+      if (search)      q = q.or(`username.ilike.%${search}%,email.ilike.%${search}%`);
+
+      const { data, error } = await q;
+      if (error) throw error;
+
+      const labelFor = k => (Array.isArray(g.options) ? g.options.find(o => o.key === k)?.label : null) || k;
+      const entries = (data || []).map(e => ({
+        ...e,
+        option_label: labelFor(e.option_key),
+        is_correct:   g.correct_option ? e.option_key === g.correct_option : null,
+      }));
+
+      return res.json({ success: true, data: entries, options: g.options || [] });
+    }
+
+    // Mock mode — entries stored on the in-memory game
+    const game = wcGames.get(key);
+    if (!game) return res.json({ success: true, data: [], options: [] });
+    let entries = (game.entries || []).map(e => ({
+      ...e,
+      option_label: (game.options || []).find(o => o.key === e.option_key)?.label || e.option_key,
+      is_correct:   game.correct_option ? e.option_key === game.correct_option : null,
+    }));
+    if (option_key) entries = entries.filter(e => e.option_key === option_key);
+    if (search) {
+      const s = search.toLowerCase();
+      entries = entries.filter(e => e.username?.toLowerCase().includes(s) || e.email?.toLowerCase().includes(s));
+    }
+    return res.json({ success: true, data: entries, options: game.options || [] });
+  } catch (err) {
+    console.error('[worldcup/entries]', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 });

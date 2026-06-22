@@ -164,6 +164,37 @@ const searchTeam = (name) =>
     return res.data.response;
   });
 
+// Finds upcoming fixtures for any team whose name matches the query — used by
+// the admin "search a match" box. Searching the global next-50 fixtures missed
+// almost everything since it isn't scoped to a league; this looks up the team
+// first, then pulls that team's own upcoming fixtures.
+const searchFixturesByTeam = (query) =>
+  cached(`fs:fixtures:search:${query.toLowerCase().replace(/\s/g, '_')}`, TTL.FIXTURES, async () => {
+    const teams = (await searchTeam(query)) || [];
+    const top   = teams.slice(0, 5);
+
+    const fixtureLists = await Promise.all(
+      top.map(t =>
+        apiSports
+          .get('/fixtures', { params: { team: t.team.id, next: 8 } })
+          .then(res => res.data.response || [])
+          .catch(() => [])
+      )
+    );
+
+    const seen = new Set();
+    const merged = [];
+    for (const list of fixtureLists) {
+      for (const f of list) {
+        if (seen.has(f.fixture.id)) continue;
+        seen.add(f.fixture.id);
+        merged.push(f);
+      }
+    }
+    merged.sort((a, b) => new Date(a.fixture.date) - new Date(b.fixture.date));
+    return merged.slice(0, 20);
+  }, []);
+
 // ── Odds ──────────────────────────────────────────────────────────────────────
 
 const getFixtureOdds = (fixtureId) =>
@@ -194,6 +225,7 @@ module.exports = {
   getUpcomingFixtures,
   getFixtureById,
   getFixturesByLeague,
+  searchFixturesByTeam,
   getMatchStats,
   getMatchLineups,
   getMatchEvents,

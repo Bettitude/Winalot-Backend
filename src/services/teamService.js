@@ -27,8 +27,19 @@ async function getTeamById(teamId) {
   return team;
 }
 
+async function getTeamInfo(teamId) {
+  const cacheKey = `team:info:${teamId}`;
+  const cached = await getCached(cacheKey);
+  if (cached) return cached;
+
+  const res  = await apiFootballClient.get('/teams', { params: { id: teamId } });
+  const data = res.data.response?.[0] || null;
+  await setCache(cacheKey, data, 86400);
+  return data;
+}
+
 async function getTeamStats(teamId, leagueId, season = new Date().getFullYear()) {
-  const cacheKey = `team:stats:${teamId}:${leagueId}`;
+  const cacheKey = `team:stats:${teamId}:${leagueId}:${season}`;
   const cached = await getCached(cacheKey);
   if (cached) return cached;
 
@@ -71,6 +82,7 @@ async function getLeagueLogo(leagueName) {
 module.exports = {
   getTeamByName,
   getTeamById,
+  getTeamInfo,
   getTeamStats,
   getTeamSquad,
   getLeagueLogo,

@@ -1,10 +1,22 @@
-const CORNERS_LINES = ['6.5', '7.5', '8.5', '9.5', '10.5'];
-const GOALS_LINES   = ['0.5', '1.5', '2.5', '3.5', '4.5'];
-const CARDS_LINES   = ['1.5', '2.5', '3.5', '4.5'];
-const SHOTS_LINES   = ['8.5', '9.5', '10.5', '12.5'];
+const CORNERS_LINES      = ['6.5', '7.5', '8.5', '9.5', '10.5'];
+const GOALS_LINES        = ['0.5', '1.5', '2.5', '3.5', '4.5'];
+const CARDS_LINES        = ['1.5', '2.5', '3.5', '4.5'];
+const YELLOW_CARDS_LINES = ['1.5', '2.5', '3.5', '4.5'];
+const RED_CARDS_LINES    = ['0.5', '1.5'];
+const SHOTS_LINES        = ['8.5', '9.5', '10.5', '12.5'];
+const OFFSIDES_LINES     = ['2.5', '3.5', '4.5', '5.5'];
+const FOULS_LINES        = ['14.5', '17.5', '20.5', '23.5'];
+const THROW_INS_LINES    = ['18.5', '21.5', '24.5'];
 
 function normalizeType(t) {
   return (t || '').toLowerCase().replace(/[\s_-]+/g, '_');
+}
+
+function ovUn(lines) {
+  return [
+    ...lines.map(v => ({ label: `OV ${v}`, value: `OV ${v}` })),
+    ...lines.map(v => ({ label: `UN ${v}`, value: `UN ${v}` })),
+  ];
 }
 
 function generateOptions(marketType, homeTeam, awayTeam) {
@@ -17,32 +29,22 @@ function generateOptions(marketType, homeTeam, awayTeam) {
       { label: awayTeam || 'Away Win',  value: awayTeam || 'Away Win' },
     ];
   }
-  if (mt.includes('corner')) {
-    return [
-      ...CORNERS_LINES.map(v => ({ label: `OV ${v}`, value: `OV ${v}` })),
-      ...CORNERS_LINES.map(v => ({ label: `UN ${v}`, value: `UN ${v}` })),
-    ];
-  }
+  if (mt.includes('corner')) return ovUn(CORNERS_LINES);
   if (mt.includes('goal') || mt === 'total_goals') {
     return [
-      ...GOALS_LINES.map(v => ({ label: `OV ${v}`, value: `OV ${v}` })),
-      ...GOALS_LINES.map(v => ({ label: `UN ${v}`, value: `UN ${v}` })),
+      ...ovUn(GOALS_LINES),
       { label: 'BTTS Yes', value: 'BTTS Yes' },
       { label: 'BTTS No',  value: 'BTTS No'  },
     ];
   }
-  if (mt.includes('card')) {
-    return [
-      ...CARDS_LINES.map(v => ({ label: `OV ${v}`, value: `OV ${v}` })),
-      ...CARDS_LINES.map(v => ({ label: `UN ${v}`, value: `UN ${v}` })),
-    ];
-  }
-  if (mt.includes('shot')) {
-    return [
-      ...SHOTS_LINES.map(v => ({ label: `OV ${v}`, value: `OV ${v}` })),
-      ...SHOTS_LINES.map(v => ({ label: `UN ${v}`, value: `UN ${v}` })),
-    ];
-  }
+  // Check specific card types before the generic 'card' fallback
+  if (mt.includes('yellow_card')) return ovUn(YELLOW_CARDS_LINES);
+  if (mt.includes('red_card'))    return ovUn(RED_CARDS_LINES);
+  if (mt.includes('card'))        return ovUn(CARDS_LINES);
+  if (mt.includes('shot'))        return ovUn(SHOTS_LINES);
+  if (mt.includes('offside'))     return ovUn(OFFSIDES_LINES);
+  if (mt.includes('foul'))        return ovUn(FOULS_LINES);
+  if (mt.includes('throw'))       return ovUn(THROW_INS_LINES);
   if (mt === 'btts') {
     return [
       { label: 'BTTS Yes', value: 'BTTS Yes' },
@@ -70,10 +72,15 @@ function identifyCorrectOption(marketType, actualResult, homeTeam, awayTeam) {
   const actual = parseFloat(actualResult);
   let lines;
 
-  if (mt.includes('corner'))      lines = CORNERS_LINES.map(Number);
-  else if (mt.includes('goal'))   lines = GOALS_LINES.map(Number);
-  else if (mt.includes('card'))   lines = CARDS_LINES.map(Number);
-  else if (mt.includes('shot'))   lines = SHOTS_LINES.map(Number);
+  if (mt.includes('corner'))           lines = CORNERS_LINES.map(Number);
+  else if (mt.includes('goal'))        lines = GOALS_LINES.map(Number);
+  else if (mt.includes('yellow_card')) lines = YELLOW_CARDS_LINES.map(Number);
+  else if (mt.includes('red_card'))    lines = RED_CARDS_LINES.map(Number);
+  else if (mt.includes('card'))        lines = CARDS_LINES.map(Number);
+  else if (mt.includes('shot'))        lines = SHOTS_LINES.map(Number);
+  else if (mt.includes('offside'))     lines = OFFSIDES_LINES.map(Number);
+  else if (mt.includes('foul'))        lines = FOULS_LINES.map(Number);
+  else if (mt.includes('throw'))       lines = THROW_INS_LINES.map(Number);
   else if (mt === 'btts') return actualResult === 'yes' ? 'BTTS Yes' : 'BTTS No';
   else return actualResult;
 

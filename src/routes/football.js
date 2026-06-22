@@ -3,7 +3,7 @@ const router  = express.Router();
 
 const {
   getLiveFixtures, getTodayFixtures, getUpcomingFixtures,
-  getFixtureById, getFixturesByLeague,
+  getFixtureById, getFixturesByLeague, searchFixturesByTeam,
   getMatchStats, getMatchLineups, getMatchEvents, getH2H, getPlayerRatings,
   getStandings, getAllLeagues, getTopLeagues,
   getTeamInfo, getTeamStats, getTeamSquad, searchTeam,
@@ -20,15 +20,8 @@ const h = fn => (req, res) =>
 
 router.get('/fixtures/search', h(async (req, res) => {
   const { q } = req.query;
-  if (!q) return res.json({ success: true, data: [] });
-  // Search upcoming fixtures by team name
-  const upcoming = await getUpcomingFixtures(50);
-  const term = q.toLowerCase();
-  const matches = (upcoming || []).filter(f => {
-    const home = (f.teams?.home?.name || '').toLowerCase();
-    const away = (f.teams?.away?.name || '').toLowerCase();
-    return home.includes(term) || away.includes(term);
-  }).slice(0, 10);
+  if (!q || q.trim().length < 3) return res.json({ success: true, data: [] });
+  const matches = await searchFixturesByTeam(q.trim());
   res.json({ success: true, data: matches });
 }));
 

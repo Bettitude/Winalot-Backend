@@ -5,7 +5,7 @@ const { getTodayFixtures, getLiveFixtures, getUpcomingFixtures, getFixtureById, 
 const { getMatchStats, getMatchLineups, getMatchEvents, getH2H, getPlayerRatings } = require('../services/matchService');
 const { getStandings, getAllLeagues, getTopLeagues } = require('../services/standingsService');
 const { getMatchOdds, getLiveOdds } = require('../services/oddsService');
-const { getTeamByName, getTeamStats, getTeamSquad } = require('../services/teamService');
+const { getTeamByName, getTeamInfo, getTeamStats, getTeamSquad } = require('../services/teamService');
 const { getSoccerNews, getNewsForTeam } = require('../services/newsService');
 const { getH2HHistorical } = require('../services/historicalService');
 const { query, IS_DB_CONFIGURED } = require('../lib/db');
@@ -167,9 +167,18 @@ router.get('/team/search', cacheMiddleware(86400), async (req, res) => {
   }
 });
 
+router.get('/team/:id/info', cacheMiddleware(86400), async (req, res) => {
+  try {
+    const data = await getTeamInfo(req.params.id);
+    res.json({ success: true, data });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 router.get('/team/:id/stats', cacheMiddleware(3600), async (req, res) => {
   try {
-    const data = await getTeamStats(req.params.id, req.query.leagueId);
+    const data = await getTeamStats(req.params.id, req.query.leagueId, req.query.season);
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

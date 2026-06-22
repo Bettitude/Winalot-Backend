@@ -174,6 +174,44 @@ const emailService = {
     });
   },
 
+  // category: 'contact' | 'partnership' | 'advertising' | ... — caller resolves notifyEmail
+  sendEnquiry({ category, name, company, email, subject, message, notifyEmail }) {
+    const escape = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const label  = subject ? escape(subject) : 'General enquiry';
+    const catLabel = category.charAt(0).toUpperCase() + category.slice(1);
+
+    // To the team — full enquiry details
+    const adminBody = [
+      `<strong>Category:</strong> ${catLabel}<br/>`,
+      `<strong>Name:</strong> ${escape(name)}<br/>`,
+      company ? `<strong>Company:</strong> ${escape(company)}<br/>` : '',
+      `<strong>Email:</strong> ${escape(email)}<br/>`,
+      `<strong>Subject:</strong> ${label}<br/><br/>`,
+      `<strong>Message:</strong><br/>${escape(message).replace(/\n/g, '<br/>')}`,
+    ].join('');
+
+    const adminPromise = send(notifyEmail, 'generic', 'Team', {
+      subject: `New ${catLabel} Enquiry — ${label}`,
+      message: adminBody,
+    }, {
+      subject: `New ${catLabel} Enquiry — ${label}`,
+      html: `<h2>New ${catLabel} Enquiry</h2><p>${adminBody}</p>`,
+    });
+
+    // To the client — confirmation
+    const clientMessage = `Hi ${name}, thanks for reaching out${subject ? ` about <strong>${escape(subject)}</strong>` : ''}. We've received your message and our team will get back to you within 24 hours.`;
+
+    const clientPromise = send(email, 'generic', name, {
+      subject: 'We received your message — WinALot',
+      message: clientMessage,
+    }, {
+      subject: 'We received your message — WinALot',
+      html: `<h2>Thanks for reaching out!</h2><p>${clientMessage}</p>`,
+    });
+
+    return Promise.all([adminPromise, clientPromise]);
+  },
+
   sendNotification(user, title, message) {
     const name = user.full_name || user.username || 'there';
     return send(user.email, 'generic', name, { subject: title, message }, {

@@ -27,6 +27,8 @@ const adminStatsRoutes    = require('./routes/adminStats');
 const referralRoutes      = require('./routes/referrals');
 const btpSettingsRoutes   = require('./routes/btpSettings');
 const adsRoutes           = require('./routes/ads');
+const enquiryRoutes       = require('./routes/enquiries');
+const changeRequestRoutes = require('./routes/changeRequests');
 
 const app    = express();
 const server = http.createServer(app);
@@ -116,6 +118,8 @@ app.use('/api/admin/stats',   adminStatsRoutes);
 app.use('/api/referrals',     referralRoutes);
 app.use('/api/btp-settings',  btpSettingsRoutes);
 app.use('/api/ads',           adsRoutes);
+app.use('/api/enquiries',     enquiryRoutes);
+app.use('/api/admin/requests', changeRequestRoutes);
 
 // ── 404 ───────────────────────────────────────────────────────────────────────
 app.use((_req, res) => res.status(404).json({ success: false, error: 'Route not found' }));

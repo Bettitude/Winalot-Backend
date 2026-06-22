@@ -27,7 +27,7 @@ async function getUser(userId) {
 
   const { data } = await supabaseAdmin
     .from('btwin_users')
-    .select('id, email, username, role, status, wallet_balance')
+    .select('id, email, username, role, status, wallet_balance, is_super_admin')
     .eq('id', userId)
     .single();
 
@@ -48,9 +48,12 @@ async function authMiddleware(req, res, next) {
 
   const token = header.split(' ')[1];
 
-  // Demo/dev bypass — dummy tokens are not real JWTs; treat them as the demo admin
+  // Demo/dev bypass — dummy tokens are not real JWTs; treat them as the demo admin.
+  // The Admin frontend's "Super Admin" demo account encodes dummy-admin-002 in its
+  // token — detect that suffix to grant superadmin overrides in demo mode too.
   if (token.startsWith('dummy_')) {
-    req.user  = { id: 'demo-admin-001', email: 'admin@winalott.com', username: 'admin', role: 'admin', status: 'enabled', wallet_balance: 0 };
+    const isSuperAdmin = token.includes('dummy-admin-002');
+    req.user  = { id: 'demo-admin-001', email: 'admin@winalott.com', username: 'admin', role: 'admin', status: 'enabled', wallet_balance: 0, is_super_admin: isSuperAdmin };
     req.token = token;
     return next();
   }

@@ -7,6 +7,7 @@ const { IS_MOCK, fixtureToMatch }   = require('../lib/mockMode');
 const { getFixtureById, getFixturePredictions } = require('../services/footballService');
 const { generateOptions, identifyCorrectOption } = require('../services/marketOptions');
 const { supabaseAdmin }             = require('../lib/supabase');
+const { createChangeRequest }       = require('../services/changeRequests');
 
 const IS_SUPABASE = !!(
   process.env.SUPABASE_URL &&
@@ -14,6 +15,22 @@ const IS_SUPABASE = !!(
   !process.env.SUPABASE_URL.includes('your-')
 );
 const TIER_ORDER = ['silver', 'gold', 'platinum'];
+
+// Entry-fee bounds per tier, in BTP/dollars (1 BTP = $1 USD)
+const TIER_PRICE_RANGE = {
+  silver:   { min: 0.10, max: 49  },
+  gold:     { min: 49,   max: 249 },
+  platinum: { min: 250,  max: 499 },
+};
+
+function validateTierFee(tier, feeDollars) {
+  const range = TIER_PRICE_RANGE[tier];
+  if (!range) return null; // free tier or unknown — no bound
+  if (feeDollars < range.min || feeDollars > range.max) {
+    return `${tier} entry fee must be between $${range.min} and $${range.max}`;
+  }
+  return null;
+}
 
 // ── GET /api/markets ───────────────────────────────────────────────────────────
 router.get('/', cacheMiddleware(60), async (req, res) => {
@@ -46,6 +63,7 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
           id, match_id, name, description, type, tier, ticket_price,
           options, correct_prediction, status, winner_count, admin_pick,
           staking_opens_at, staking_closes_at, prize_pool, created_at,
+          min_entries, max_entries,
           btwin_matches!inner (id, team_home, team_away, league, api_football_id, match_date)
         `, { count: 'exact' })
         .order('created_at', { ascending: false })
@@ -89,6 +107,8 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
           auto_options:     Array.isArray(r.options) ? r.options : (r.options ? r.options : null),
           tier_pools:       [],
           total_entries:    ticketCounts[r.id] || 0,
+          min_entries:      r.min_entries,
+          max_entries:      r.max_entries,
           team_home:        match.team_home,
           team_away:        match.team_away,
           league:           match.league,
@@ -216,6 +236,11 @@ router.post('/bulk', adminMiddleware, async (req, res) => {
 
         for (const tp of tiers) {
           if (!tp.tier) continue;
+
+          const feeDollars = parseFloat(tp.entry_fee_points || tp.entry_fee || 0.5);
+          const feeError = validateTierFee(tp.tier, feeDollars);
+          if (feeError) { results.errors.push({ fixture_id: fx.fixture_id, error: feeError }); continue; }
+
           const { data: existing } = await supabaseAdmin
             .from('btwin_markets')
             .select('id')
@@ -231,7 +256,7 @@ router.post('/bulk', adminMiddleware, async (req, res) => {
             description:       pickToStore || market_type,
             type:              prediction_type,
             tier:              tp.tier,
-            ticket_price:      parseInt(tp.entry_fee_points || 100) * 100,
+            ticket_price:      Math.round(feeDollars * 100),
             options:           autoOptions || null,
             admin_pick:        pickToStore,
             winner_count:      parseInt(tp.winner_count || 1),
@@ -239,6 +264,8 @@ router.post('/bulk', adminMiddleware, async (req, res) => {
             staking_opens_at:  staking_opens_at || null,
             staking_closes_at: staking_closes_at || null,
             prize_pool:        0,
+            min_entries:       tp.min_entries != null && tp.min_entries !== '' ? parseInt(tp.min_entries) : null,
+            max_entries:       tp.max_entries != null && tp.max_entries !== '' ? parseInt(tp.max_entries) : null,
           });
         }
 
@@ -466,6 +493,59 @@ router.get('/fixture/:fixtureId', async (req, res) => {
   }
 });
 
+// ── GET /api/markets/:id/activity — live "who's entering" feed for a pool ─────
+router.get('/:id/activity', async (req, res) => {
+  if (IS_MOCK) return res.json({ success: true, data: { entry_count: 0, recent: [] } });
+
+  if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+    try {
+      const { data: tickets, count, error } = await supabaseAdmin
+        .from('btwin_tickets')
+        .select('user_id, user_prediction, created_at', { count: 'exact' })
+        .eq('market_id', req.params.id)
+        .neq('status', 'voided')
+        .order('created_at', { ascending: false })
+        .limit(15);
+      if (error) throw error;
+
+      const userIds = [...new Set((tickets || []).map(t => t.user_id).filter(Boolean))];
+      const { data: users } = userIds.length
+        ? await supabaseAdmin.from('btwin_users').select('id, username').in('id', userIds)
+        : { data: [] };
+      const uMap = Object.fromEntries((users || []).map(u => [u.id, u.username]));
+
+      const recent = (tickets || []).map(t => ({
+        username:   uMap[t.user_id] || 'player',
+        prediction: t.user_prediction,
+        created_at: t.created_at,
+      }));
+
+      return res.json({ success: true, data: { entry_count: count || 0, recent } });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
+  if (!IS_DB_CONFIGURED) return res.json({ success: true, data: { entry_count: 0, recent: [] } });
+
+  try {
+    const recent = await query(
+      `SELECT u.username, t.user_prediction AS prediction, t.purchased_at AS created_at
+       FROM tickets t JOIN users u ON u.id = t.user_id
+       WHERE t.market_id = ? AND t.status NOT IN ('voided')
+       ORDER BY t.purchased_at DESC LIMIT 15`,
+      [req.params.id]
+    );
+    const [{ cnt } = { cnt: 0 }] = await query(
+      `SELECT COUNT(*) AS cnt FROM tickets WHERE market_id = ? AND status NOT IN ('voided')`,
+      [req.params.id]
+    );
+    return res.json({ success: true, data: { entry_count: cnt || 0, recent } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── GET /api/markets/:id ───────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
   if (IS_MOCK) return res.status(404).json({ success: false, error: 'No market found in mock mode' });
@@ -577,8 +657,14 @@ router.post('/', adminMiddleware, async (req, res) => {
         : [{ tier: tier || 'silver', entry_fee_points: entry_fee || 100, winner_count: winner_count || 1 }];
 
       const created = [];
+      const tierErrors = [];
       for (const tp of tierList) {
         if (!tp.tier) continue;
+
+        const feeDollars = parseFloat(tp.entry_fee_points || tp.entry_fee || 0.5);
+        const feeError = validateTierFee(tp.tier, feeDollars);
+        if (feeError) { tierErrors.push(feeError); continue; }
+
         const { data: mkt, error: mkErr } = await supabaseAdmin
           .from('btwin_markets')
           .insert({
@@ -587,7 +673,7 @@ router.post('/', adminMiddleware, async (req, res) => {
             description:        pickToStore || market_type,
             type:               prediction_type,
             tier:               tp.tier,
-            ticket_price:       parseInt(tp.entry_fee_points || tp.entry_fee || 100) * 100,
+            ticket_price:       Math.round(feeDollars * 100),
             options:            autoOptions || null,
             admin_pick:         pickToStore,
             winner_count:       parseInt(tp.winner_count || 1),
@@ -595,6 +681,8 @@ router.post('/', adminMiddleware, async (req, res) => {
             staking_opens_at:   staking_opens_at || null,
             staking_closes_at:  staking_closes_at || null,
             prize_pool:         0,
+            min_entries:        tp.min_entries != null && tp.min_entries !== '' ? parseInt(tp.min_entries) : null,
+            max_entries:        tp.max_entries != null && tp.max_entries !== '' ? parseInt(tp.max_entries) : null,
           })
           .select()
           .single();
@@ -602,7 +690,12 @@ router.post('/', adminMiddleware, async (req, res) => {
         created.push(mkt);
       }
 
-      if (!created.length) return res.status(500).json({ success: false, error: 'No markets could be created — check btwin_markets schema has required columns' });
+      if (!created.length) {
+        const error = tierErrors.length
+          ? tierErrors.join('; ')
+          : 'No markets could be created — check btwin_markets schema has required columns';
+        return res.status(400).json({ success: false, error });
+      }
       auditLog(req.user.id, 'CREATE_MARKET', created.map(m => m.id).join(','));
       return res.status(201).json({
         success: true,
@@ -703,10 +796,32 @@ router.post('/', adminMiddleware, async (req, res) => {
 
 // ── PUT /api/markets/:id ───────────────────────────────────────────────────────
 router.put('/:id', adminMiddleware, async (req, res) => {
+  // Regular admins can't change ticket price directly — it goes to a super
+  // admin for approval. (Other fields in the same request still apply below.)
+  if (!req.user?.is_super_admin && req.body.entry_fee !== undefined) {
+    try {
+      const cr = await createChangeRequest({
+        type:         'market_price_change',
+        target_id:    req.params.id,
+        payload:      { market_id: req.params.id, updates: { ticket_price: Math.round(parseFloat(req.body.entry_fee) * 100) } },
+        summary:      `Change ticket price for market ${req.params.id} to $${req.body.entry_fee}`,
+        requested_by: req.user?.id,
+      });
+      delete req.body.entry_fee; // strip so the rest of this request can still apply other fields directly
+      if (Object.keys(req.body).length === 0) {
+        return res.status(202).json({ success: true, pending: true, data: cr, message: 'Price change submitted for super admin approval' });
+      }
+      res.locals.priceChangePending = cr;
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   const allowed = [
     'market_type', 'prediction_type', 'admin_pick', 'auto_options',
     'tier', 'entry_fee', 'winner_count', 'status', 'correct_outcome',
     'actual_result', 'staking_opens_at', 'staking_closes_at',
+    'min_entries', 'max_entries',
   ];
   const updates = {};
   allowed.forEach(k => {
@@ -733,6 +848,8 @@ router.put('/:id', adminMiddleware, async (req, res) => {
       if (updates.actual_result)    sbUpdates.description       = updates.actual_result;
       if (updates.staking_opens_at) sbUpdates.staking_opens_at  = updates.staking_opens_at;
       if (updates.staking_closes_at) sbUpdates.staking_closes_at = updates.staking_closes_at;
+      if (updates.min_entries !== undefined) sbUpdates.min_entries = updates.min_entries === '' || updates.min_entries == null ? null : parseInt(updates.min_entries);
+      if (updates.max_entries !== undefined) sbUpdates.max_entries = updates.max_entries === '' || updates.max_entries == null ? null : parseInt(updates.max_entries);
 
       if (Object.keys(sbUpdates).length > 0) {
         const { error } = await supabaseAdmin.from('btwin_markets').update(sbUpdates).eq('id', req.params.id);
@@ -741,7 +858,11 @@ router.put('/:id', adminMiddleware, async (req, res) => {
 
       const { data: market } = await supabaseAdmin.from('btwin_markets').select('*').eq('id', req.params.id).single();
       auditLog(req.user.id, 'UPDATE_MARKET', req.params.id);
-      return res.json({ success: true, data: { market: { ...market, tier_pools: [] } } });
+      return res.json({
+        success: true,
+        data: { market: { ...market, tier_pools: [] } },
+        ...(res.locals.priceChangePending ? { pending: true, pendingRequest: res.locals.priceChangePending } : {}),
+      });
     } catch (err) {
       return res.status(500).json({ success: false, error: err.message });
     }

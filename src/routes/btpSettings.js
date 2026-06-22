@@ -2,6 +2,7 @@ const express = require('express');
 const router  = express.Router();
 const { adminMiddleware } = require('../middleware/admin');
 const { supabaseAdmin }   = require('../lib/supabase');
+const { createChangeRequest } = require('../services/changeRequests');
 
 const IS_SUPABASE = !!(
   process.env.SUPABASE_URL &&
@@ -55,6 +56,26 @@ router.put('/', adminMiddleware, async (req, res) => {
   if (!IS_SUPABASE) {
     return res.json({ success: true, data: req.body });
   }
+
+  // Regular admins can't change the BTP/dollar conversion or fees directly —
+  // it goes to a super admin for approval first.
+  if (!req.user?.is_super_admin) {
+    try {
+      const updates = {};
+      BTP_KEYS.forEach(k => { if (req.body[k] !== undefined && req.body[k] !== '') updates[k] = req.body[k]; });
+      const cr = await createChangeRequest({
+        type:         'btp_rate_change',
+        target_id:    null,
+        payload:      { updates },
+        summary:      `Change BTP settings: ${Object.keys(updates).join(', ') || 'none'}`,
+        requested_by: req.user?.id,
+      });
+      return res.status(202).json({ success: true, pending: true, data: cr, message: 'Submitted for super admin approval' });
+    } catch (err) {
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
   try {
     const rows = BTP_KEYS
       .filter(k => req.body[k] !== undefined && req.body[k] !== '')

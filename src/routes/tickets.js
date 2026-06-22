@@ -235,11 +235,23 @@ router.post('/', authMiddleware, async (req, res) => {
       // Get market
       const { data: market, error: mErr } = await supabaseAdmin
         .from('btwin_markets')
-        .select('id, match_id, name, tier, ticket_price, status, winner_count, prize_pool')
+        .select('id, match_id, name, tier, ticket_price, status, winner_count, prize_pool, max_entries')
         .eq('id', market_id)
         .single();
       if (mErr || !market) return res.status(404).json({ success: false, error: 'Market not found' });
       if (market.status !== 'active') return res.status(400).json({ success: false, error: 'Market is not open for staking' });
+
+      // Enforce admin-configured entry cap (null/unset = unlimited)
+      if (market.max_entries != null) {
+        const { count: entryCount } = await supabaseAdmin
+          .from('btwin_tickets')
+          .select('id', { count: 'exact', head: true })
+          .eq('market_id', market_id)
+          .neq('status', 'voided');
+        if ((entryCount || 0) >= market.max_entries) {
+          return res.status(400).json({ success: false, error: 'This pool is full' });
+        }
+      }
 
       // Check match timing
       const { data: matchRow } = await supabaseAdmin

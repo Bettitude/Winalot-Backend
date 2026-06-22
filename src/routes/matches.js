@@ -46,7 +46,7 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
     }
   }
 
-  const { status = 'active', league, page = 1, limit = 20 } = req.query;
+  const { status = 'active', league, page = 1, limit = 20, date } = req.query;
 
   // ── Supabase path ──────────────────────────────────────────────────────────
   if (!IS_DB_CONFIGURED && IS_SUPABASE) {
@@ -60,6 +60,11 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
 
       if (status !== 'all') q = q.eq('status', status);
       if (league)           q = q.eq('league', league);
+      if (date) {
+        const dayStart = new Date(`${date}T00:00:00Z`);
+        const dayEnd   = new Date(`${date}T23:59:59.999Z`);
+        q = q.gte('match_date', dayStart.toISOString()).lte('match_date', dayEnd.toISOString());
+      }
 
       const { data: rawMatches, count, error } = await q;
       if (error) throw error;
@@ -113,6 +118,7 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
     const params = [];
     if (status !== 'all') { where += ' AND m.status = ?'; params.push(status); }
     if (league)           { where += ' AND m.league = ?'; params.push(league); }
+    if (date)             { where += ' AND DATE(m.match_date) = DATE(?)'; params.push(date); }
 
     const matches = await query(
       `SELECT m.*,
@@ -145,6 +151,36 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
     const totals = await query(`SELECT COUNT(DISTINCT m.id) AS total FROM matches m ${where}`, params);
 
     return res.json({ success: true, data: { matches, total: totals[0]?.total || 0, page: parseInt(page), limit: parseInt(limit) } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/matches/calendar — admin: match counts per day, for the date-schedule calendar
+router.get('/calendar', adminMiddleware, async (req, res) => {
+  if (IS_MOCK) return res.json({ success: true, data: { days: [] } });
+
+  try {
+    let rows;
+    if (!IS_DB_CONFIGURED && IS_SUPABASE) {
+      const { data, error } = await supabaseAdmin.from('btwin_matches').select('match_date');
+      if (error) throw error;
+      rows = data || [];
+    } else if (IS_DB_CONFIGURED) {
+      rows = await query('SELECT match_date FROM matches');
+    } else {
+      rows = [];
+    }
+
+    const counts = {};
+    for (const r of rows) {
+      if (!r.match_date) continue;
+      const day = new Date(r.match_date).toISOString().slice(0, 10);
+      counts[day] = (counts[day] || 0) + 1;
+    }
+
+    const days = Object.entries(counts).map(([date, count]) => ({ date, count }));
+    return res.json({ success: true, data: { days } });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
