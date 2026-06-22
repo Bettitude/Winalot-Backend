@@ -80,21 +80,39 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
         // Count tickets per market for fill_percent / total_entries
         const marketIdList = (mkData || []).map(m => m.id);
         let ticketCounts = {};
+        let optionCounts = {}; // { marketId: { optionKey: count } }
         if (marketIdList.length) {
           const { data: tcData } = await supabaseAdmin
             .from('btwin_tickets')
-            .select('market_id')
+            .select('market_id, option_picked')
             .in('market_id', marketIdList);
           for (const t of (tcData || [])) {
             ticketCounts[t.market_id] = (ticketCounts[t.market_id] || 0) + 1;
+            if (t.option_picked) {
+              if (!optionCounts[t.market_id]) optionCounts[t.market_id] = {};
+              optionCounts[t.market_id][t.option_picked] = (optionCounts[t.market_id][t.option_picked] || 0) + 1;
+            }
           }
         }
 
         for (const mk of (mkData || [])) {
           if (!marketsMap[mk.match_id]) marketsMap[mk.match_id] = [];
+          const total = ticketCounts[mk.id] || 0;
+          const rawOptions = Array.isArray(mk.options) ? mk.options : (mk.options ? [mk.options] : ['yes', 'no']);
+          const counts = optionCounts[mk.id] || {};
+          // Real, live crowd consensus — % of actual tickets per option. No dummy data.
+          const option_breakdown = rawOptions.map(o => {
+            const opt = typeof o === 'string' ? { key: o, label: o } : o;
+            return {
+              key:   opt.key,
+              label: opt.label,
+              pct:   total ? Math.round(((counts[opt.key] || 0) / total) * 1000) / 10 : 0,
+            };
+          });
           marketsMap[mk.match_id].push({
             ...mk,
-            total_entries: ticketCounts[mk.id] || 0,
+            total_entries: total,
+            option_breakdown,
           });
         }
       }

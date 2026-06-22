@@ -8,6 +8,7 @@ const { getFixtureById, getFixturePredictions } = require('../services/footballS
 const { generateOptions, identifyCorrectOption } = require('../services/marketOptions');
 const { supabaseAdmin }             = require('../lib/supabase');
 const { createChangeRequest }       = require('../services/changeRequests');
+const { buildMovementSeries }       = require('../services/movement');
 
 const IS_SUPABASE = !!(
   process.env.SUPABASE_URL &&
@@ -80,19 +81,36 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
       // Group by market so each market shows all its tiers
       const marketIds = (rows || []).map(r => r.id);
       let ticketCounts = {};
+      let optionCounts = {}; // { marketId: { optionKey: count } }
       if (marketIds.length) {
         const { data: tix } = await supabaseAdmin
           .from('btwin_tickets')
-          .select('market_id')
+          .select('market_id, option_picked')
           .in('market_id', marketIds)
           .neq('status', 'voided');
         for (const t of (tix || [])) {
           ticketCounts[t.market_id] = (ticketCounts[t.market_id] || 0) + 1;
+          if (t.option_picked) {
+            if (!optionCounts[t.market_id]) optionCounts[t.market_id] = {};
+            optionCounts[t.market_id][t.option_picked] = (optionCounts[t.market_id][t.option_picked] || 0) + 1;
+          }
         }
       }
 
       const markets = (rows || []).map(r => {
         const match = r.btwin_matches || {};
+        const total = ticketCounts[r.id] || 0;
+        const rawOptions = Array.isArray(r.options) ? r.options : (r.options ? [r.options] : ['yes', 'no']);
+        const counts = optionCounts[r.id] || {};
+        // Real, live crowd consensus — % of actual tickets per option. No dummy data.
+        const option_breakdown = rawOptions.map(o => {
+          const opt = typeof o === 'string' ? { key: o, label: o } : o;
+          return {
+            key:   opt.key,
+            label: opt.label,
+            pct:   total ? Math.round(((counts[opt.key] || 0) / total) * 1000) / 10 : 0,
+          };
+        });
         return {
           id:               r.id,
           match_id:         r.match_id,
@@ -106,7 +124,8 @@ router.get('/', cacheMiddleware(60), async (req, res) => {
           status:           r.status,
           auto_options:     Array.isArray(r.options) ? r.options : (r.options ? r.options : null),
           tier_pools:       [],
-          total_entries:    ticketCounts[r.id] || 0,
+          total_entries:    total,
+          option_breakdown,
           min_entries:      r.min_entries,
           max_entries:      r.max_entries,
           team_home:        match.team_home,
@@ -597,6 +616,34 @@ router.get('/:id/options', async (req, res) => {
       : generateOptions(market.market_type, market.team_home, market.team_away);
 
     return res.json({ success: true, data: { options } });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/markets/:id/movement — public ──────────────────────────────────────
+// Real % share of each option over time, built from actual tickets' timestamps.
+router.get('/:id/movement', async (req, res) => {
+  if (IS_MOCK || !IS_SUPABASE) return res.json({ success: true, data: { options: [], points: [] } });
+
+  try {
+    const { data: market } = await supabaseAdmin
+      .from('btwin_markets').select('id, options').eq('id', req.params.id).maybeSingle();
+    if (!market) return res.status(404).json({ success: false, error: 'Market not found' });
+
+    const { data: tickets, error } = await supabaseAdmin
+      .from('btwin_tickets')
+      .select('option_picked, created_at')
+      .eq('market_id', req.params.id)
+      .neq('status', 'voided')
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    const rawOptions = Array.isArray(market.options) ? market.options : ['yes', 'no'];
+    const options    = rawOptions.map(o => (typeof o === 'string' ? { key: o, label: o } : o));
+
+    const points = buildMovementSeries(tickets || [], options, 'option_picked');
+    return res.json({ success: true, data: { options, points } });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }

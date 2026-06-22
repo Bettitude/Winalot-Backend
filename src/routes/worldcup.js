@@ -7,6 +7,7 @@ const { authMiddleware }  = require('../middleware/auth');
 const { emailService }    = require('../services/email');
 const { supabaseAdmin }   = require('../lib/supabase');
 const { createChangeRequest } = require('../services/changeRequests');
+const { buildMovementSeries } = require('../services/movement');
 
 const IS_DB = !!(
   process.env.SUPABASE_URL &&
@@ -825,6 +826,37 @@ router.get('/games/:fixtureId/entries', adminMiddleware, async (req, res) => {
     return res.json({ success: true, data: entries, options: game.options || [] });
   } catch (err) {
     console.error('[worldcup/entries]', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/worldcup/games/:fixtureId/movement — public ─────────────────────
+// Real % share of each option over time, built from actual entries' timestamps.
+router.get('/games/:fixtureId/movement', async (req, res) => {
+  const key = req.params.fixtureId;
+  try {
+    if (!IS_DB) {
+      const game = wcGames.get(key);
+      if (!game) return res.json({ success: true, data: { options: [], points: [] } });
+      const points = buildMovementSeries(game.entries || [], game.options || [], 'option_key');
+      return res.json({ success: true, data: { options: game.options || [], points } });
+    }
+
+    const { data: game } = await supabaseAdmin
+      .from('btwin_wc_games').select('id, options').eq('fixture_id', key).maybeSingle();
+    if (!game) return res.json({ success: true, data: { options: [], points: [] } });
+
+    const { data: entries, error } = await supabaseAdmin
+      .from('btwin_wc_entries')
+      .select('option_key, created_at')
+      .eq('game_id', game.id)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    const points = buildMovementSeries(entries || [], game.options || [], 'option_key');
+    return res.json({ success: true, data: { options: game.options || [], points } });
+  } catch (err) {
+    console.error('[worldcup/movement]', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
