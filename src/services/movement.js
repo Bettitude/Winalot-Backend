@@ -4,7 +4,7 @@
 // created_at timestamp. Downsampled so charts stay readable at high volume.
 const MAX_POINTS = 60;
 
-function buildMovementSeries(rows, options, field) {
+function buildMovementSeries(rows, options, field, tsField = 'created_at') {
   if (!rows?.length) return [];
 
   const keys   = options.map(o => (typeof o === 'string' ? o : o.key));
@@ -23,7 +23,7 @@ function buildMovementSeries(rows, options, field) {
     for (const k of Object.keys(counts)) {
       pcts[k] = total ? Math.round((counts[k] / total) * 1000) / 10 : 0;
     }
-    allPoints.push({ ts: row.created_at, pcts });
+    allPoints.push({ ts: row[tsField], pcts });
   }
 
   if (allPoints.length <= MAX_POINTS) return allPoints;
